@@ -1,0 +1,15 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.4
+pydantic-settings==2.4.0
+SQLAlchemy==2.0.29
+psycopg2-binary==2.9.10  # Corrected from 2.9.9 as discussed
+redis==5.0.1
+chromadb==0.4.24
+langchain-core==0.3.65        # Latest stable as of search results
+langchain-community==0.3.25   # Latest stable as of search results
+langchain-google-genai==2.1.5 # Latest stable as of search results
+alembic==1.13.1
+python-dotenv==1.0.1
+loguru==0.7.2
+numpy==1.26.4

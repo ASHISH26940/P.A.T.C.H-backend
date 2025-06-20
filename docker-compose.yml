@@ -1,0 +1,65 @@
+# docker-compose.yml (or podman-compose.yml)
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: cogniflow_postgres
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: cogniflowdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d cogniflowdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cogniflow_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: cogniflow_redis
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - cogniflow_network
+
+
+  chromadb-server: # You'd uncomment/add this if you need the server
+    image: ghcr.io/chroma-core/chroma:0.4.24 # Or your preferred version
+    container_name: cogniflow_chromadb
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=False
+    volumes:
+      - chromadb_data:/app/chroma/chroma
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cogniflow_network
+
+volumes:
+  postgres_data:
+  redis_data:
+  chromadb_data: # ADD THIS VOLUME for ChromaDB
+
+networks:
+  cogniflow_network:
+    driver: bridge
