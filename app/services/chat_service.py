@@ -1,220 +1,259 @@
 # app/services/chat_service.py
 
+from typing import Dict, Any, List, Optional
+from loguru import logger
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.language_models import BaseChatModel
+from langchain_core.runnables import RunnableLambda
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+
+from app.models.chat import ChatRequest, ChatResponse
+from app.models.document import Document, DocumentQueryResult # Ensure this is imported
 from app.core.llm_client import get_chat_llm
 from app.services.vector_store import VectorStoreService
 from app.services.context_injector import ContextInjectorService
-from app.models.chat import ChatRequest, ChatResponse
-from app.models.document import DocumentQueryResult
-from typing import List, Dict, Optional, Any
+from app.core.config import settings # Import settings for thresholds
 import uuid
-from loguru import logger
-
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
-# from langchain_google_genai import ChatGoogleGenerativeAI # Not directly imported, but self.llm_model is this type
+from datetime import datetime,timezone
 
 class ChatService:
-    # Define the LLM's context window size (approximate for Gemini 1.5 Flash)
-    # A safe working window, slightly less than the actual max to account for output tokens.
-    LLM_CONTEXT_WINDOW = 120000 # Gemini 1.5 Flash has 128K context window
-    # Threshold (percentage) at which to start truncating history
-    LLM_TOKEN_THRESHOLD_PERCENTAGE = 0.90 # e.g., 90% of LLM_CONTEXT_WINDOW
-
     def __init__(
         self,
         vector_store_service: VectorStoreService,
-        context_injector_service: ContextInjectorService
+        context_injector_service: ContextInjectorService,
+        llm: Optional[BaseChatModel] = None,
     ):
         self.vector_store_service = vector_store_service
         self.context_injector_service = context_injector_service
-        self.llm_model = get_chat_llm()
+        self.llm = llm if llm else get_chat_llm()
+        self.output_parser = StrOutputParser()
 
-    # Helper to convert internal dict format to Langchain's BaseMessage format
-    def _to_langchain_message_format(self, messages: List[Dict]) -> List[BaseMessage]:
-        langchain_formatted_messages = []
-        for msg in messages:
-            # Note: We expect messages from Redis get_chat_history to be Dicts.
-            # If past_messages from ChatRequest are ever converted to a Pydantic model
-            # before reaching here, adjust this logic to access msg.role, msg.content
-            # This current implementation is robust for both Dict and Pydantic.
-            if isinstance(msg, dict):
-                role = msg.get("role")
-                content = msg.get("content")
-            else: # Fallback for objects (like Pydantic models)
-                role = getattr(msg, "role", None)
-                content = getattr(msg, "content", None)
+        # Define the system prompt for the LLM
+        self.system_prompt_template = """
+        You are a helpful and knowledgeable AI assistant. Your goal is to provide accurate and concise answers based on the provided context.
+        If the answer cannot be found in the context, politely state that you don't know or that the information is not available in the provided documents.
+        Avoid making up information. Maintain a consistent persona. Be concise and to the point.
 
-            if role and content:
-                if role == "user":
-                    langchain_formatted_messages.append(HumanMessage(content=content))
-                elif role == "model" or role == "assistant":
-                    langchain_formatted_messages.append(AIMessage(content=content))
-        return langchain_formatted_messages
+        {rag_context}
+        {history_context}
+        {cognitive_context}
+        """
+
+        # Initialize the prompt template
+        self.prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", self.system_prompt_template),
+                MessagesPlaceholder(variable_name="messages"),
+            ]
+        )
+
+        # Build the RAG chain (simplified for this example)
+        self.rag_chain = self.prompt | self.llm | self.output_parser
 
     async def process_chat_message(self, request: ChatRequest) -> ChatResponse:
-        logger.info(f"Processing chat message for user '{request.user_id}' in collection '{request.collection_name}'")
+        user_id = request.user_id
+        user_message_content = request.user_message
+        collection_name = request.collection_name
+        message_id = str(uuid.uuid4()) # Generate a unique ID for this message
 
-        message_id = str(uuid.uuid4())
-        source_documents_for_response = []
+        logger.info(f"Processing chat message for user '{user_id}' in collection '{collection_name}'")
 
-        # --- Step 1: Retrieval Augmented Generation (RAG) ---
-        rag_query_text = request.user_message
-        retrieved_documents: List[DocumentQueryResult] = await self.vector_store_service.query_documents(
-            query_text=rag_query_text,
-            collection_name=request.collection_name, 
-            n_results=4
-        )
+        all_source_documents_for_response: List[DocumentQueryResult] = []
+        rag_context_parts = []
         
-        document_context = ""
-        if retrieved_documents:
-            source_documents_for_response = retrieved_documents 
-            
-            doc_texts = [doc.document.content for doc in retrieved_documents if doc.document and doc.document.content]
-            if doc_texts:
-                # Add a clear heading for RAG context in the prompt
-                document_context = "\n\n--- Start Relevant Documents ---\n" + "\n---\n".join(doc_texts) + "\n--- End Relevant Documents ---\n\n"
-                logger.info(f"Retrieved {len(doc_texts)} documents for RAG.")
-            else:
-                logger.info("No relevant document content found for RAG.")
-        else:
-            logger.info("No documents retrieved for RAG.")
-
-
-        # --- Step 2: Fetch Full Conversation History from Redis ---
-        # Fetch ALL available chat history from Redis for comprehensive token management
-        # Request.past_messages are only for initial client context, Redis is the canonical source
-        full_conversation_history_from_redis: List[Dict] = await self.context_injector_service.get_chat_history(
-            user_id=request.user_id,
-            limit=self.context_injector_service.MAX_CHAT_HISTORY_LENGTH # Fetch up to max stored
-        )
-        logger.info(f"Fetched {len(full_conversation_history_from_redis)} messages from Redis for token management.")
-
-        # Convert Redis history to Langchain's message format
-        history_for_llm_processing: List[BaseMessage] = self._to_langchain_message_format(full_conversation_history_from_redis)
-
-        # Append the *current* user message to the history for token calculation
-        # This will be the last message in the list
-        current_user_message_lc = HumanMessage(content=request.user_message)
-        history_for_llm_processing.append(current_user_message_lc)
-
-
-        # --- Step 3: Construct System Instruction and Truncate History for LLM Prompt ---
-        # System instruction and RAG context should ideally be combined and static,
-        # or prepended to the first message, or handled as a SystemMessage.
-        # For invoke, we usually prepend it to the current user query or have a dedicated
-        # system message at the start if the LLM supports it without affecting turn-taking.
-
-        # Let's count tokens for system instruction and RAG context first.
-        # This part of the prompt is relatively static or derived from RAG.
-        # We'll prepend it to the *current* user message's content before sending to LLM.
-        system_instruction = (
-            "You are a helpful and knowledgeable AI assistant. "
-            "Your goal is to provide accurate and concise answers based on the provided context. "
-            "If the answer cannot be found in the context, politely state that you don't know "
-            "or that the information is not available in the provided documents. "
-            "Avoid making up information."
-        )
-        
-        # Combine system instruction and RAG context
-        initial_prompt_context = f"{system_instruction}{document_context}"
-        
-        # Calculate maximum allowed tokens for chat history, considering context window and RAG/system parts.
-        # We need to count tokens of the `initial_prompt_context` and then subtract it from the LLM_CONTEXT_WINDOW.
-        # Note: Langchain's `get_num_tokens_from_messages` doesn't directly take a string.
-        # For system/RAG context that isn't part of the turn-by-turn history,
-        # we can put it as the content of the initial user message.
-        # Let's count tokens with a placeholder `HumanMessage` to estimate.
-        
-        # Temporarily create a list including only the system/RAG context for token counting
-        temp_system_rag_message_list = [HumanMessage(content=initial_prompt_context)]
-        system_rag_tokens = self.llm_model.get_num_tokens_from_messages(temp_system_rag_message_list)
-        
-        # Ensure we leave enough space for the current user's message itself and potential AI response tokens
-        # A conservative estimate for the current message and response could be 1000-2000 tokens,
-        # depending on expected verbosity. Let's reserve some buffer.
-        RESERVED_TOKENS_FOR_CURRENT_TURN_AND_OUTPUT = 2000 
-
-        max_tokens_for_history = (self.LLM_CONTEXT_WINDOW * self.LLM_TOKEN_THRESHOLD_PERCENTAGE) \
-                               - system_rag_tokens \
-                               - RESERVED_TOKENS_FOR_CURRENT_TURN_AND_OUTPUT
-
-        logger.debug(f"LLM Context Window: {self.LLM_CONTEXT_WINDOW}, Threshold: {self.LLM_TOKEN_THRESHOLD_PERCENTAGE*100}%")
-        logger.debug(f"System/RAG Context Tokens: {system_rag_tokens}")
-        logger.debug(f"Max Tokens for History: {max_tokens_for_history}")
-
-
-        # Truncate history if it exceeds the calculated max_tokens_for_history
-        current_history_tokens = self.llm_model.get_num_tokens_from_messages(history_for_llm_processing)
-        logger.debug(f"Current full history (incl. current user message) tokens: {current_history_tokens}")
-        
-        # If the current total (including the new message) already exceeds the overall limit after RAG/System
-        # we need to truncate from the beginning of `history_for_llm_processing`
-        
-        # This loop removes oldest messages until token count is within limits
-        # It's crucial to remove from the *start* (oldest) of the history list
-        # since the most recent messages are usually more relevant.
-        while current_history_tokens > max_tokens_for_history and len(history_for_llm_processing) > 2: # Keep at least user/model for basic convo
-            # Remove the oldest message (first element)
-            history_for_llm_processing.pop(0) 
-            current_history_tokens = self.llm_model.get_num_tokens_from_messages(history_for_llm_processing)
-            logger.debug(f"History truncated. New token count: {current_history_tokens}")
-
-        if current_history_tokens > max_tokens_for_history:
-             logger.warning(f"Despite truncation, history still exceeds max_tokens_for_history. "
-                            f"Remaining tokens: {current_history_tokens} > {max_tokens_for_history}. "
-                            f"This might indicate too little space for history or a very long current query/context.")
-
-
-        # Final prompt construction:
-        # We inject the system_and_rag_context into the *first* HumanMessage in the history.
-        # If history_for_llm_processing is empty (very first message), it means current_user_message_lc is the first.
-        # If it's not empty, it contains the truncated history. The last message is always the current user's.
-        
-        final_messages_for_llm = []
-        if history_for_llm_processing:
-            # Create a new list for the final messages to send to the LLM
-            # The first message (oldest in the truncated history) gets the combined context
-            first_message_content = history_for_llm_processing[0].content
-            final_messages_for_llm.append(HumanMessage(content=f"{initial_prompt_context}\n\n{first_message_content}"))
-            
-            # Append the rest of the truncated history
-            final_messages_for_llm.extend(history_for_llm_processing[1:])
-        else:
-            # If no history, just send the current user message with context
-            final_messages_for_llm.append(HumanMessage(content=f"{system_and_rag_context}\n\nUser Query: {request.user_message}"))
-
-        logger.debug(f"Final messages for LLM: {final_messages_for_llm}")
-        logger.debug(f"Final token count for LLM: {self.llm_model.get_num_tokens_from_messages(final_messages_for_llm)}")
-
-
-        # --- Step 4: Call Gemini using ainvoke() ---
-        ai_response_content = "I'm sorry, I couldn't generate a response."
+        # --- Layer 1: User's Past Questions & Answers (Vector Store) ---
+        user_qa_collection_name = f"user_past_questions_answers"
         try:
-            gemini_response_message = await self.llm_model.ainvoke(
-                final_messages_for_llm # Use the token-managed messages
+            logger.debug(f"Attempting to retrieve past Q&A for user '{user_id}' with threshold {settings.CHROMA_PAST_QA_SIMILARITY_THRESHOLD}")
+            past_qa_documents = await self.vector_store_service.query_documents(
+                user_qa_collection_name,
+                user_message_content,
+                n_results=settings.CHROMA_PAST_QA_N_RESULTS,
+                min_similarity_score=settings.CHROMA_PAST_QA_SIMILARITY_THRESHOLD
             )
-            ai_response_content = gemini_response_message.content
+            if past_qa_documents:
+                logger.info(f"Found {len(past_qa_documents)} past Q&A documents for user '{user_id}'.")
+                rag_context_parts.append("### Relevant Past Interactions:\n")
+                for doc in past_qa_documents:
+                    rag_context_parts.append(f"- Q: {doc.document.metadata.get('question', 'N/A')}\n  A: {doc.document.content}\n")
+                all_source_documents_for_response.extend(past_qa_documents)
+            else:
+                logger.info("No similar past question found above threshold.")
+        except Exception as e:
+            logger.warning(f"Failed to retrieve past Q&A for user '{user_id}': {e}")
+
+        # --- Layer 2: General Knowledge Base (Vector Store) ---
+        try:
+            logger.debug(f"Attempting to retrieve general knowledge documents for collection '{collection_name}' with threshold {settings.CHROMA_GENERAL_SIMILARITY_THRESHOLD}")
+            general_documents = await self.vector_store_service.query_documents(
+                collection_name,
+                user_message_content,
+                n_results=settings.CHROMA_GENERAL_N_RESULTS,
+                min_similarity_score=settings.CHROMA_GENERAL_SIMILARITY_THRESHOLD
+            )
+            if general_documents:
+                logger.info(f"Found {len(general_documents)} general documents for collection '{collection_name}'.")
+                rag_context_parts.append("### General Knowledge:\n")
+                for doc in general_documents:
+                    rag_context_parts.append(f"- {doc.document.content}\n")
+                all_source_documents_for_response.extend(general_documents)
+            else:
+                logger.info("No general documents retrieved for RAG.")
+        except Exception as e:
+            logger.warning(f"Failed to retrieve general knowledge for collection '{collection_name}': {e}")
+
+
+        # --- Layer 3: Historical Context Retrieval (Redis/Long-term memory keywords) ---
+        history_context_str = ""
+        keywords_for_historical_context = ["yesterday", "last time", "previous conversation", "memory", "remember", "before"]
+        if any(keyword in user_message_content.lower() for keyword in keywords_for_historical_context):
+            try:
+                logger.debug(f"Keywords detected for Historical Context. Attempting to retrieve long-term memory for user '{user_id}'.")
+                # Assuming you have a collection for user's long-term memory/summaries
+                user_long_term_memory_collection = f"user_long_term_memory"
+                historical_documents = await self.vector_store_service.query_documents(
+                    user_long_term_memory_collection,
+                    user_message_content,
+                    n_results=settings.CHROMA_HISTORY_N_RESULTS,
+                    min_similarity_score=settings.CHROMA_HISTORY_SIMILARITY_THRESHOLD
+                )
+                if historical_documents:
+                    logger.info(f"Found {len(historical_documents)} historical context documents for user '{user_id}'.")
+                    history_context_str = "### Historical Context (Long-Term Memory):\n"
+                    for doc in historical_documents:
+                        history_context_str += f"- {doc.document.content}\n"
+                    all_source_documents_for_response.extend(historical_documents)
+                else:
+                    logger.info("No historical context documents retrieved from long-term memory.")
+            except Exception as e:
+                logger.warning(f"Failed to retrieve historical context for user '{user_id}': {e}")
+        else:
+            logger.info("No keywords detected for Historical Context. Skipping long-term memory retrieval.")
+
+        # --- Layer 4: Cognitive Knowledge Base (Vector Store) ---
+        cognitive_context_str = ""
+        try:
+            logger.debug(f"Attempting to retrieve cognitive knowledge documents for user '{user_id}'.")
+            cognitive_knowledge_collection = f"cognitive_knowledge_base" # A general cognitive base for all users
+            cognitive_documents = await self.vector_store_service.query_documents(
+                cognitive_knowledge_collection,
+                user_message_content,
+                n_results=settings.CHROMA_COGNITIVE_N_RESULTS,
+                min_similarity_score=settings.CHROMA_COGNITIVE_SIMILARITY_THRESHOLD
+            )
+            if cognitive_documents:
+                logger.info(f"Found {len(cognitive_documents)} cognitive knowledge documents.")
+                cognitive_context_str = "### Cognitive Knowledge:\n"
+                for doc in cognitive_documents:
+                    cognitive_context_str += f"- {doc.document.content}\n"
+                all_source_documents_for_response.extend(cognitive_documents)
+            else:
+                logger.info("No cognitive knowledge documents retrieved.")
+        except Exception as e:
+            logger.warning(f"Failed to retrieve cognitive knowledge: {e}")
+
+        rag_context = "\n".join(rag_context_parts) if rag_context_parts else "No specific RAG context provided."
+        
+        # Determine if any RAG or historical/cognitive context was generated
+        if not rag_context_parts and not history_context_str and not cognitive_context_str:
+            logger.info("No significant RAG or historical/cognitive context generated.")
+
+
+        # --- Prepare messages for LLM (including chat history from Redis) ---
+        full_chat_history_from_redis = await self.context_injector_service.get_chat_history(user_id)
+        logger.info(f"Fetched {len(full_chat_history_from_redis)} messages from Redis for token management.")
+
+        # Construct messages for the LLM, ensuring token limits are respected
+        messages_for_llm = []
+        # The system message is constructed with the RAG/history/cognitive context
+        system_message_content = self.system_prompt_template.format(
+            rag_context=rag_context,
+            history_context=history_context_str,
+            cognitive_context=cognitive_context_str
+        )
+        messages_for_llm.append(SystemMessage(content=system_message_content))
+
+        # Add historical messages, trimming if necessary
+        # We need to estimate token count. A rough estimate is 4 chars per token.
+        # This is a basic approach and can be refined with actual tokenizers if needed.
+        system_tokens = len(system_message_content) / 4 # Rough estimate
+        logger.debug(f"LLM Context Window: {settings.LLM_CONTEXT_WINDOW}, Threshold: {settings.LLM_TOKEN_THRESHOLD_PERCENTAGE}%")
+        logger.debug(f"System/RAG Context Tokens: {system_tokens}")
+        
+        max_history_tokens = settings.LLM_CONTEXT_WINDOW * (settings.LLM_TOKEN_THRESHOLD_PERCENTAGE / 100) - system_tokens
+        logger.debug(f"Max Tokens for History: {max_history_tokens}")
+        
+        current_history_tokens = 0
+        trimmed_history = []
+        for msg_dict in reversed(full_chat_history_from_redis):
+            msg_content = msg_dict.get("content", "")
+            msg_role = msg_dict.get("role", "")
+            
+            # Rough token count for this message
+            msg_tokens = len(msg_content) / 4
+            
+            if current_history_tokens + msg_tokens <= max_history_tokens:
+                if msg_role == "human":
+                    trimmed_history.insert(0, HumanMessage(content=msg_content))
+                elif msg_role == "ai":
+                    trimmed_history.insert(0, AIMessage(content=msg_content))
+                current_history_tokens += msg_tokens
+            else:
+                logger.warning(f"Trimming chat history to fit context window. Skipped message: {msg_content[:50]}...")
+                break # Stop adding if next message exceeds limit
+
+        messages_for_llm.extend(trimmed_history)
+        # Add the current user message at the end
+        messages_for_llm.append(HumanMessage(content=user_message_content))
+
+        # Re-calculate total tokens for debug logging
+        final_token_count = sum(len(m.content) for m in messages_for_llm if hasattr(m, 'content')) / 4 + (len(messages_for_llm) * 4) # Add a small buffer for message objects
+        logger.debug(f"Final messages for LLM: {messages_for_llm}")
+        logger.debug(f"Final token count for LLM: {final_token_count}")
+
+        # --- Invoke LLM ---
+        try:
+            logger.info("Invoking LLM for response generation...")
+            llm_response_message = await self.llm.ainvoke(messages_for_llm)
+            ai_response_content = llm_response_message.content
             logger.info("Gemini response generated successfully using ainvoke().")
         except Exception as e:
-            logger.error(f"Error generating content from Gemini: {e}", exc_info=True)
-            ai_response_content = "I apologize, but I encountered an error trying to generate a response. Please try again later."
+            logger.error(f"Error generating Gemini response: {e}")
+            ai_response_content = "I am sorry, but I encountered an error while processing your request."
 
-
-        # --- Step 5: Store the Full Current Turn into Redis ---
+        # --- Store conversation turn in Redis ---
         await self.context_injector_service.add_message_to_history(
-            user_id=request.user_id,
-            role="user",
-            content=request.user_message
+            user_id=user_id,
+            role="human",
+            content=user_message_content
         )
         await self.context_injector_service.add_message_to_history(
-            user_id=request.user_id,
-            role="model",
+            user_id=user_id,
+            role="ai",
             content=ai_response_content
         )
-        logger.info(f"Conversation turn stored in Redis for user '{request.user_id}'.")
+        logger.info(f"Conversation turn stored in Redis for user '{user_id}'.")
 
+        # --- Store new Q&A in Past Questions & Answers collection ---
+        try:
+            new_qa_document = Document(
+                id=str(uuid.uuid4()),
+                content=ai_response_content,
+                metadata={"user_id": user_id, "question": user_message_content, "timestamp": datetime.now(timezone.utc).isoformat()}
+            )
+            await self.vector_store_service.add_documents(
+                user_qa_collection_name,
+                [new_qa_document]
+            )
+            logger.info(f"Stored new Q&A pair in '{user_qa_collection_name}'.")
+        except Exception as e:
+            logger.error(f"Failed to store Q&A pair in vector store: {e}")
 
+        # --- Construct and return ChatResponse ---
         return ChatResponse(
             ai_response=ai_response_content,
-            source_documents=source_documents_for_response,
+            # This line was corrected to extract the 'document' and then dump it.
+            source_documents=[doc_qr.document.model_dump() for doc_qr in all_source_documents_for_response if doc_qr.document],
             message_id=message_id
         )

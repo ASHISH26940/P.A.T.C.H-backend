@@ -7,6 +7,7 @@ from app.api.v1.router import api_router
 from app.core.database import init_db
 from app.core.redis_client import init_redis_client, close_redis_client
 from app.core.chroma_client import init_chroma_client
+from fastapi.middleware.cors import CORSMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -62,6 +63,13 @@ app=FastAPI(
     description="Internal API SERVICE for memory and context management.",
     version="1.0.0",
     lifespan=lifespan
+)
+app.add_middleware(
+    CORSMiddleware, # <--- You need to specify the middleware class here
+    allow_origins=["*"],
+    allow_credentials=True,  # Recommended for most scenarios, especially if you plan to use cookies/auth
+    allow_methods=["*"],     # Allows all standard HTTP methods
+    allow_headers=["*"],     # Allows all headers
 )
 
 app.include_router(api_router,prefix="/v1")

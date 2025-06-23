@@ -1,10 +1,10 @@
 from sqlalchemy.ext.asyncio import create_async_engine,async_sessionmaker,AsyncSession
-from sqlalchemy.orm import declarative_base
-from sqlalchemy import text
+from sqlalchemy.orm import declarative_base,Mapped,mapped_column
+from sqlalchemy import text,Column,Integer,String,Boolean
 from app.core.config import settings
 from loguru import logger
 import asyncio
-from typing import AsyncGenerator
+from typing import AsyncGenerator,Optional
 
 Base=declarative_base()
 
@@ -102,3 +102,16 @@ async def dispose_db():
     if async_engine:
         await async_engine.dispose()
         logger.info("Database engine connections disposed.")
+
+
+class User(Base):
+    __tablename__="users"
+
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,index=True)
+    username:Mapped[str]=mapped_column(String,unique=True,index=True)
+    email:Mapped[Optional[str]]=mapped_column(String,unique=True,index=True,nullable=True)
+    hashed_password:Mapped[str]=mapped_column(String)
+    is_active:Mapped[bool]=mapped_column(Boolean,default=True)
+
+    def __repr__(self):
+        return f"<User(id={self.id}, username='{self.username}', email='{self.email}')>"
