@@ -30,12 +30,14 @@ class ChatService:
         self.output_parser = StrOutputParser()
 
         # Define the system prompt for the LLM
+        # Removed {rag_context} from system prompt as Layer 1 will be appended to HumanMessage
+        # Other RAG layers (General, Cognitive) will still use rag_context.
         self.system_prompt_template = """
         You are a helpful and knowledgeable AI assistant. Your goal is to provide accurate and concise answers based on the provided context.
         If the answer cannot be found in the context, politely state that you don't know or that the information is not available in the provided documents.
         Avoid making up information. Maintain a consistent persona. Be concise and to the point.
 
-        {rag_context}
+        {general_rag_context}
         {history_context}
         {cognitive_context}
         """
@@ -60,7 +62,9 @@ class ChatService:
         logger.info(f"Processing chat message for user '{user_id}' in collection '{collection_name}'")
 
         all_source_documents_for_response: List[DocumentQueryResult] = []
-        rag_context_parts = []
+        
+        # New list to hold formatted past AI responses for prepending to human message
+        past_ai_responses_for_prepend: List[str] = []
         
         # --- Layer 1: User's Past Questions & Answers (Vector Store) ---
         user_qa_collection_name = f"user_past_questions_answers"
@@ -74,14 +78,32 @@ class ChatService:
             )
             if past_qa_documents:
                 logger.info(f"Found {len(past_qa_documents)} past Q&A documents for user '{user_id}'.")
-                rag_context_parts.append("### Relevant Past Interactions:\n")
                 for doc in past_qa_documents:
-                    rag_context_parts.append(f"- Q: {doc.document.metadata.get('question', 'N/A')}\n  A: {doc.document.content}\n")
+                    # Parse timestamp and format it
+                    timestamp_str = doc.document.metadata.get('timestamp')
+                    formatted_date = "unknown date"
+                    if timestamp_str:
+                        try:
+                            # Assuming ISO format like '2025-06-23T20:16:05.920+00:00'
+                            dt_object = datetime.fromisoformat(timestamp_str)
+                            # Format to a more human-readable date, e.g., "June 23, 2025"
+                            formatted_date = dt_object.strftime("%B %d, %Y")
+                        except ValueError:
+                            logger.warning(f"Could not parse timestamp '{timestamp_str}' for past AI response.")
+                    
+                    # Prepare the string for prepending to the human message
+                    past_ai_responses_for_prepend.append(
+                        f"AI's past response on {formatted_date}: {doc.document.content}"
+                    )
+                    logger.debug(f"Prepared past AI response for prepend: {past_ai_responses_for_prepend[-1]}")
                 all_source_documents_for_response.extend(past_qa_documents)
             else:
                 logger.info("No similar past question found above threshold.")
         except Exception as e:
             logger.warning(f"Failed to retrieve past Q&A for user '{user_id}': {e}")
+        
+        # --- Prepare General RAG context (from Layer 2 and 4, as Layer 1 is now prepended) ---
+        general_rag_context_parts = []
 
         # --- Layer 2: General Knowledge Base (Vector Store) ---
         try:
@@ -94,9 +116,9 @@ class ChatService:
             )
             if general_documents:
                 logger.info(f"Found {len(general_documents)} general documents for collection '{collection_name}'.")
-                rag_context_parts.append("### General Knowledge:\n")
+                general_rag_context_parts.append("### General Knowledge:\n")
                 for doc in general_documents:
-                    rag_context_parts.append(f"- {doc.document.content}\n")
+                    general_rag_context_parts.append(f"- {doc.document.content}\n")
                 all_source_documents_for_response.extend(general_documents)
             else:
                 logger.info("No general documents retrieved for RAG.")
@@ -106,7 +128,7 @@ class ChatService:
 
         # --- Layer 3: Historical Context Retrieval (Redis/Long-term memory keywords) ---
         history_context_str = ""
-        keywords_for_historical_context = ["yesterday", "last time", "previous conversation", "memory", "remember", "before"]
+        keywords_for_historical_context = ["yesterday", "last time", "previous conversation", "memory", "remember", "before", "information", "informations"]
         if any(keyword in user_message_content.lower() for keyword in keywords_for_historical_context):
             try:
                 logger.debug(f"Keywords detected for Historical Context. Attempting to retrieve long-term memory for user '{user_id}'.")
@@ -153,10 +175,10 @@ class ChatService:
         except Exception as e:
             logger.warning(f"Failed to retrieve cognitive knowledge: {e}")
 
-        rag_context = "\n".join(rag_context_parts) if rag_context_parts else "No specific RAG context provided."
+        general_rag_context = "\n".join(general_rag_context_parts) if general_rag_context_parts else "No specific RAG context provided."
         
         # Determine if any RAG or historical/cognitive context was generated
-        if not rag_context_parts and not history_context_str and not cognitive_context_str:
+        if not general_rag_context_parts and not history_context_str and not cognitive_context_str and not past_ai_responses_for_prepend:
             logger.info("No significant RAG or historical/cognitive context generated.")
 
 
@@ -168,11 +190,13 @@ class ChatService:
         messages_for_llm = []
         # The system message is constructed with the RAG/history/cognitive context
         system_message_content = self.system_prompt_template.format(
-            rag_context=rag_context,
+            general_rag_context=general_rag_context, # Renamed from rag_context
             history_context=history_context_str,
             cognitive_context=cognitive_context_str
         )
         messages_for_llm.append(SystemMessage(content=system_message_content))
+        logger.debug(f"System Message content generated: {system_message_content[:200]}...")
+
 
         # Add historical messages, trimming if necessary
         # We need to estimate token count. A rough estimate is 4 chars per token.
@@ -186,7 +210,7 @@ class ChatService:
         
         current_history_tokens = 0
         trimmed_history = []
-        for msg_dict in reversed(full_chat_history_from_redis):
+        for msg_dict in full_chat_history_from_redis:
             msg_content = msg_dict.get("content", "")
             msg_role = msg_dict.get("role", "")
             
@@ -203,9 +227,19 @@ class ChatService:
                 logger.warning(f"Trimming chat history to fit context window. Skipped message: {msg_content[:50]}...")
                 break # Stop adding if next message exceeds limit
 
+        logger.debug(f"trimmed history : {trimmed_history}");
         messages_for_llm.extend(trimmed_history)
-        # Add the current user message at the end
-        messages_for_llm.append(HumanMessage(content=user_message_content))
+        
+        # --- Append past AI responses to the current user message ---
+        modified_user_message_content = user_message_content
+        if past_ai_responses_for_prepend:
+            # Join all prepended responses and add a separator
+            prepended_context = "\n".join(past_ai_responses_for_prepend) + "\n\n"
+            modified_user_message_content = prepended_context + user_message_content
+            logger.debug(f"User message modified with past AI responses. New message starts with: {modified_user_message_content[:100]}...")
+        
+        # Add the current user message (potentially modified) at the end
+        messages_for_llm.append(HumanMessage(content=modified_user_message_content))
 
         # Re-calculate total tokens for debug logging
         final_token_count = sum(len(m.content) for m in messages_for_llm if hasattr(m, 'content')) / 4 + (len(messages_for_llm) * 4) # Add a small buffer for message objects
@@ -226,7 +260,7 @@ class ChatService:
         await self.context_injector_service.add_message_to_history(
             user_id=user_id,
             role="human",
-            content=user_message_content
+            content=user_message_content # Store original user message in Redis
         )
         await self.context_injector_service.add_message_to_history(
             user_id=user_id,

@@ -155,11 +155,18 @@ class VectorStoreService:
                 # For now, let's interpret `min_similarity_score` as the *maximum acceptable distance*.
                 # If you need it to be a 0-1 similarity score, you'll need to define a distance-to-similarity function.
                 if min_similarity_score is not None:
-                    # Assuming min_similarity_score is actually max_distance_threshold for L2
-                    if dist > min_similarity_score:
-                        logger.debug(f"Skipping document {doc_id} due to distance {dist} exceeding threshold {min_similarity_score}")
-                        continue # Skip this document if its distance is too high
+                    # Convert ChromaDB's distance (0=identical, larger=dissimilar)
+                    # to a similarity score (1=identical, smaller=dissimilar)
+                    # Assuming distance is in [0, 1] range for normalized cosine distance
+                    calculated_similarity = 1 - dist
 
+                    if calculated_similarity < min_similarity_score:
+                        logger.debug(
+                            f"Skipping document {id} due to calculated similarity {calculated_similarity:.4f} "
+                            f"being less than threshold {min_similarity_score:.4f} (distance was {dist:.4f})"
+                        )
+                        continue
+                
                 query_result_list.append(
                     DocumentQueryResult(
                         document=Document(
