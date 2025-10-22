@@ -54,7 +54,7 @@ services:
       - cogniflow_network
 
   backend:
-    build: .
+    build: cogniflow-backend:latest
     container_name: cogniflow_backend
     restart: unless-stopped
     depends_on:
@@ -66,7 +66,7 @@ services:
     networks:
       - cogniflow_network
     environment:
-      DATABASE_URL: postgres://user:password@db:5432/cogniflowdb
+      DATABASE_URL: postgresql+asyncpg://user:password@db:5432/cogniflowdb
       REDIS_URL: redis://redis:6379
       CHROMADB_URL: http://chromadb-server:8000
 
