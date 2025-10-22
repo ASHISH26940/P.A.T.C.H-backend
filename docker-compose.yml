@@ -1,5 +1,4 @@
-# docker-compose.yml (or podman-compose.yml)
-version: '3.8'
+#version: '3.8'
 
 services:
   db:
@@ -36,9 +35,8 @@ services:
     networks:
       - cogniflow_network
 
-
-  chromadb-server: # You'd uncomment/add this if you need the server
-    image: ghcr.io/chroma-core/chroma:0.4.24 # Or your preferred version
+  chromadb-server:
+    image: ghcr.io/chroma-core/chroma:0.4.24
     container_name: cogniflow_chromadb
     environment:
       - IS_PERSISTENT=TRUE
@@ -55,10 +53,45 @@ services:
     networks:
       - cogniflow_network
 
+  backend:
+    build: .
+    container_name: cogniflow_backend
+    restart: unless-stopped
+    depends_on:
+      - db
+      - redis
+      - chromadb-server
+    ports:
+      - "5000:5000"
+    networks:
+      - cogniflow_network
+    environment:
+      DATABASE_URL: postgres://user:password@db:5432/cogniflowdb
+      REDIS_URL: redis://redis:6379
+      CHROMADB_URL: http://chromadb-server:8000
+
+  caddy:
+    image: caddy:latest
+    container_name: caddy
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - cogniflow_network
+
 volumes:
   postgres_data:
   redis_data:
-  chromadb_data: # ADD THIS VOLUME for ChromaDB
+  chromadb_data:
+  caddy_data:
+  caddy_config:
 
 networks:
   cogniflow_network:
