@@ -4,8 +4,6 @@ services:
     name: patch-postgres
     plan: free
     region: oregon
-    databaseName: cogniflowdb
-    databaseUser: cogniflowuser
 
   # Redis Cache
   - type: redis
