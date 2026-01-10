@@ -1,0 +1,13 @@
+FROM ghcr.io/chroma-core/chroma:1.4.0
+
+# Set environment variables
+ENV IS_PERSISTENT=TRUE
+ENV ANONYMIZED_TELEMETRY=False
+ENV CHROMA_SERVER_AUTHN_CREDENTIALS=""
+ENV CHROMA_SERVER_AUTHN_PROVIDER=""
+
+# ChromaDB runs on port 8000
+EXPOSE 8000
+
+# Start ChromaDB server
+CMD ["uvicorn", "chromadb.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

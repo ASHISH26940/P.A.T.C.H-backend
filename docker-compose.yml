@@ -5,77 +5,140 @@ services:
     image: postgres:16-alpine
     container_name: cogniflow_postgres
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: cogniflowdb
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-cogniflowdb}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user -d cogniflowdb"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-cogniflowdb}" ]
       interval: 5s
       timeout: 5s
       retries: 5
+      start_period: 10s
     networks:
       - cogniflow_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
 
   redis:
     image: redis:7-alpine
     container_name: cogniflow_redis
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 5s
     networks:
       - cogniflow_network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
   chromadb-server:
-    image: ghcr.io/chroma-core/chroma:0.4.24
+    image: ghcr.io/chroma-core/chroma:1.4.0
     container_name: cogniflow_chromadb
     environment:
       - IS_PERSISTENT=TRUE
       - ANONYMIZED_TELEMETRY=False
+      - CHROMA_SERVER_AUTHN_CREDENTIALS=
+      - CHROMA_SERVER_AUTHN_PROVIDER=
     volumes:
-      - chromadb_data:/app/chroma/chroma
+      - chromadb_data:/chroma/chroma
     ports:
       - "8000:8000"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
     networks:
       - cogniflow_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
 
   backend:
-    build: cogniflow-backend:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cogniflow-backend:latest
     container_name: cogniflow_backend
     restart: unless-stopped
     depends_on:
-      - db
-      - redis
-      - chromadb-server
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chromadb-server:
+        condition: service_started
     ports:
       - "5000:5000"
     networks:
       - cogniflow_network
     environment:
-      DATABASE_URL: postgresql+asyncpg://user:password@db:5432/cogniflowdb
-      REDIS_URL: redis://redis:6379
-      CHROMADB_URL: http://chromadb-server:8000
+      # Database configuration
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://user:password@db:5432/cogniflowdb}
+      POSTGRES_DB: ${POSTGRES_DB:-cogniflowdb}
+
+      # Redis configuration
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_URL: redis://${REDIS_HOST:-redis}:${REDIS_PORT:-6379}
+
+      # ChromaDB configuration
+      CHROMADB_HOST: ${CHROMADB_HOST:-chromadb-server}
+      CHROMADB_PORT: ${CHROMADB_PORT:-8000}
+      CHROMADB_URL: http://${CHROMADB_HOST:-chromadb-server}:${CHROMADB_PORT:-8000}
+
+      # Google Gemini API Key (REQUIRED - Set via .env file or here)
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+
+      # JWT Security
+      SECRET_KEY: ${SECRET_KEY:-change_this_in_production}
+      ALGORITHM: ${ALGORITHM:-HS256}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:5000/v1/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
 
   caddy:
     image: caddy:latest
     container_name: caddy
     restart: unless-stopped
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     ports:
       - "80:80"
       - "443:443"
@@ -92,6 +155,7 @@ volumes:
   chromadb_data:
   caddy_data:
   caddy_config:
+
 
 networks:
   cogniflow_network:

@@ -1,0 +1,91 @@
+services:
+  # PostgreSQL Database
+  - type: pserv
+    name: patch-postgres
+    plan: free
+    region: oregon
+    databaseName: cogniflowdb
+    databaseUser: cogniflowuser
+
+  # Redis Cache
+  - type: redis
+    name: patch-redis
+    plan: free
+    region: oregon
+    maxmemoryPolicy: allkeys-lru
+
+  # ChromaDB Vector Store Service
+  - type: web
+    name: patch-chromadb
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile.chromadb
+    envVars:
+      - key: IS_PERSISTENT
+        value: "TRUE"
+      - key: ANONYMIZED_TELEMETRY
+        value: "False"
+    disk:
+      name: chromadb-data
+      mountPath: /chroma/chroma
+      sizeGB: 1
+
+  # FastAPI Backend Application
+  - type: web
+    name: patch-backend
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /v1/health
+    envVars:
+      # Database Configuration
+      - key: DATABASE_URL
+        fromDatabase:
+          name: patch-postgres
+          property: connectionString
+      - key: POSTGRES_DB
+        value: cogniflowdb
+
+      # Redis Configuration
+      - key: REDIS_URL
+        fromService:
+          name: patch-redis
+          type: redis
+          property: connectionString
+      - key: REDIS_HOST
+        fromService:
+          name: patch-redis
+          type: redis
+          property: host
+      - key: REDIS_PORT
+        fromService:
+          name: patch-redis
+          type: redis
+          property: port
+
+      # ChromaDB Configuration
+      - key: CHROMADB_HOST
+        fromService:
+          name: patch-chromadb
+          type: web
+          property: host
+      - key: CHROMADB_PORT
+        value: "443"
+      - key: CHROMADB_URL
+        value: https://${{patch-chromadb.host}}
+
+      # Security - IMPORTANT: Set these in Render dashboard
+      - key: GEMINI_API_KEY
+        sync: false # You must set this manually in Render dashboard
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ALGORITHM
+        value: HS256
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "1440"
+
+      # Application Environment
+      - key: ENVIRONMENT
+        value: production

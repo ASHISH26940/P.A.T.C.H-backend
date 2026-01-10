@@ -1,23 +1,22 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt
 from fastapi import HTTPException, status, Depends # Ensure Depends is imported
 from fastapi.security import OAuth2PasswordBearer
 from app.core.config import settings
 from sqlalchemy.ext.asyncio import AsyncSession
+from loguru import logger
 
 from app.models.token import TokenData # Ensure this is imported
 from app.core.database import get_db, User as DBUser # Ensure these are imported (DBUser is the SQLAlchemy model)
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-def verify_password(plain_password:str,hashed_password:str):
-    return pwd_context.verify(plain_password,hashed_password)
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 
-def get_password(password:str)->str:
-    return pwd_context.hash(password)
+def get_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 oauth2_scheme=OAuth2PasswordBearer(tokenUrl="/v1/auth/token")
 
@@ -63,9 +62,12 @@ async def get_current_user(
     Raises HTTPException if credentials are invalid or user not found.
     """
     from app.services.user_service import UserService
+    
+    logger.debug(f"get_current_user called. Token (first 20 chars): {token[:20] if token else 'None'}...")
+    
     credentials_exception=HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
+        detail="Not authenticated",
         headers={
             "WWW-Authenticate":"Bearer"
         }
@@ -73,17 +75,29 @@ async def get_current_user(
 
     try:
         payload=verify_token(token=token)
+        logger.debug(f"Token verified successfully. Payload: {payload}")
+        
         username:str=payload.get("sub")
         if username is None:
+            logger.error("Token payload missing 'sub' claim")
             raise credentials_exception
-        token_data=TokenData(usernmae=username)
-    except JWTError:
+        
+        token_data=TokenData(username=username)
+        logger.debug(f"Looking up user in database: {username}")
+        
+    except JWTError as e:
+        logger.error(f"JWT verification failed: {e}")
         raise credentials_exception
     
     user_service=UserService(db=db)
-    user =await user_service.get_user_by_username(token_data.usernmae)
+    user =await user_service.get_user_by_username(token_data.username)
+    
     if user is None:
+        logger.error(f"User not found in database: {token_data.username}")
         raise credentials_exception
     if not user.is_active:
+        logger.error(f"Inactive user attempted access: {token_data.username}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,detail="Inactive User")
+    
+    logger.debug(f"Successfully authenticated user: {username}")
     return user
