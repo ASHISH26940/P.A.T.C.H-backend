@@ -5,12 +5,13 @@ services:
     plan: free
     region: oregon
 
-  # Redis Cache
+  # Redis Cache - Free tier requires IP allowlist
   - type: redis
     name: patch-redis
     plan: free
     region: oregon
     maxmemoryPolicy: allkeys-lru
+    ipAllowList: [] # Empty array allows all IPs (required for free tier)
 
   # ChromaDB Vector Store Service
   - type: web
@@ -21,13 +22,10 @@ services:
     dockerfilePath: ./Dockerfile.chromadb
     envVars:
       - key: IS_PERSISTENT
-        value: "TRUE"
+        value: "FALSE" # Changed to FALSE - no persistent disk on free tier
       - key: ANONYMIZED_TELEMETRY
         value: "False"
-    disk:
-      name: chromadb-data
-      mountPath: /chroma/chroma
-      sizeGB: 1
+    # Removed disk configuration - not supported on free tier
 
   # FastAPI Backend Application
   - type: web
@@ -44,7 +42,9 @@ services:
           name: patch-postgres
           property: connectionString
       - key: POSTGRES_DB
-        value: cogniflowdb
+        fromDatabase:
+          name: patch-postgres
+          property: database
 
       # Redis Configuration
       - key: REDIS_URL
