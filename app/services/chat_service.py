@@ -48,29 +48,34 @@ Your normal response here.
         user_message = request.user_message
         message_id = str(uuid.uuid4())
 
-        important_memories = await self.memory_service.get_important_memories(
-            user_id=user_id, limit=3
-        )
-        relevant_memories = await self.memory_service.search_memories(
-            user_id=user_id,
-            query=user_message,
-            n_results=settings.MEMORY_N_RESULTS,
-            min_similarity=settings.MEMORY_SIMILARITY_THRESHOLD,
-        )
+        combined = []
+        memory_context = ""
+        try:
+            important_memories = await self.memory_service.get_important_memories(
+                user_id=user_id, limit=3
+            )
+            relevant_memories = await self.memory_service.search_memories(
+                user_id=user_id,
+                query=user_message,
+                n_results=settings.MEMORY_N_RESULTS,
+                min_similarity=settings.MEMORY_SIMILARITY_THRESHOLD,
+            )
 
-        seen_ids = {m.id for m in relevant_memories}
-        combined = list(relevant_memories)
-        for m in important_memories:
-            if m.id not in seen_ids:
-                combined.append(m)
-                seen_ids.add(m.id)
+            seen_ids = {m.id for m in relevant_memories}
+            combined = list(relevant_memories)
+            for m in important_memories:
+                if m.id not in seen_ids:
+                    combined.append(m)
+                    seen_ids.add(m.id)
 
-        memory_context_parts = []
-        for mem in combined:
-            memory_context_parts.append(f"[{mem.memory_type}] {mem.content}")
-        memory_context = (
-            "\n".join(memory_context_parts) if memory_context_parts else ""
-        )
+            memory_context_parts = []
+            for mem in combined:
+                memory_context_parts.append(f"[{mem.memory_type}] {mem.content}")
+            memory_context = (
+                "\n".join(memory_context_parts) if memory_context_parts else ""
+            )
+        except Exception as e:
+            logger.warning(f"Memory retrieval failed (continuing without context): {e}")
 
         chat_history = await self.memory_service.get_chat_history(
             user_id=user_id, limit=50
@@ -108,7 +113,10 @@ Your normal response here.
         messages_for_llm.append(HumanMessage(content=user_message))
 
         try:
-            ai_response = await self.chain.ainvoke({"messages": messages_for_llm})
+            ai_response = await self.chain.ainvoke({
+                "messages": messages_for_llm,
+                "memory_context": memory_context,
+            })
         except Exception as e:
             logger.error(f"LLM invocation failed: {e}")
             ai_response = "Sorry, I encountered an error processing your request."

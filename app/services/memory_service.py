@@ -25,7 +25,11 @@ class MemoryService:
         metadata: Optional[dict] = None,
         importance: float = 0.5,
     ) -> Memory:
-        embedding = self.embedder.embed_documents([content])[0]
+        embedding = None
+        try:
+            embedding = self.embedder.embed_documents([content])[0]
+        except Exception as e:
+            logger.warning(f"Embedding failed for memory (storing without vector): {e}")
         memory = Memory(
             id=str(uuid.uuid4()),
             user_id=user_id,
@@ -50,7 +54,11 @@ class MemoryService:
         memory_type: Optional[str] = None,
         min_similarity: float = 0.3,
     ) -> List[Memory]:
-        query_vec = np.array(self.embedder.embed_query(query))
+        try:
+            query_vec = np.array(self.embedder.embed_query(query))
+        except Exception as e:
+            logger.warning(f"Embedding failed for search query (returning empty): {e}")
+            return []
 
         filters = [Memory.user_id == user_id]
         if memory_type:
