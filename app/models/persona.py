@@ -1,4 +1,4 @@
-# cogniflow-ai-service/app/models/persona.py
+# app/models/persona.py
 import uuid
 from sqlalchemy import Column, String, Text
 from sqlalchemy.dialects.postgresql import UUID, ARRAY
