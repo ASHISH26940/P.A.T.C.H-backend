@@ -1,13 +1,10 @@
 import subprocess
 import json
-import tempfile
-import os
 import httpx
 import re
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
-from app.core.config import settings
 from app.core.llm_client import get_chat_llm
 from app.services.memory_service import MemoryService
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -29,49 +26,56 @@ Format each line as:
 
 Extract aggressively. Every specific technique, named framework, quoted statistic, referenced book/tool/person, mental model, or tactical step should be its own 📝 line. Break compound ideas into separate lines. Don't summarize — atomize."""
 
+MOBILE_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36"
+
 
 def _extract_video_id(url: str) -> str | None:
     m = re.search(r"(?:v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/|youtube\.com/v/)([A-Za-z0-9_-]{11})", url)
     return m.group(1) if m else None
 
 
-async def _fetch_via_youtube_api(url: str) -> dict:
-    """Fallback: fetch video metadata via YouTube Data API v3."""
+async def _fetch_via_oembed(url: str) -> dict | None:
+    """Fallback: YouTube oEmbed API — no key required."""
     video_id = _extract_video_id(url)
     if not video_id:
-        raise VideoIngestionError("Could not extract video ID from URL")
-    if not settings.YOUTUBE_API_KEY:
-        raise VideoIngestionError("YouTube API key not configured")
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://www.youtube.com/oembed",
+                params={"url": f"https://www.youtube.com/watch?v={video_id}", "format": "json"},
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            return {
+                "title": data.get("title", "Unknown"),
+                "channel": data.get("author_name", None),
+            }
+    except Exception as e:
+        logger.warning(f"oEmbed failed: {e}")
+    return None
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            "https://www.googleapis.com/youtube/v3/videos",
-            params={
-                "part": "snippet,contentDetails",
-                "id": video_id,
-                "key": settings.YOUTUBE_API_KEY,
-            },
-        )
-    if resp.status_code != 200:
-        raise VideoIngestionError(f"YouTube API returned {resp.status_code}: {resp.text}")
 
-    data = resp.json()
-    items = data.get("items", [])
-    if not items:
-        raise VideoIngestionError("Video not found on YouTube")
-
-    snippet = items[0]["snippet"]
-    duration_iso = items[0]["contentDetails"]["duration"]
-    import isodate
-    duration_seconds = int(isodate.parse_duration(duration_iso).total_seconds())
-
-    return {
-        "video_title": snippet["title"],
-        "channel": snippet["channelTitle"],
-        "duration": duration_seconds,
-        "subtitles_available": False,
-        "description": snippet.get("description", ""),
-    }
+async def _scrape_description(video_id: str) -> str:
+    """Try to extract video description from page meta tags."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"https://www.youtube.com/watch?v={video_id}",
+                headers={"User-Agent": MOBILE_UA},
+            )
+        if resp.status_code != 200:
+            return ""
+        html = resp.text
+        m = re.search(r'<meta\s+name="description"\s+content="([^"]+)"', html)
+        if m:
+            return m.group(1).replace("&#39;", "'").replace("&amp;", "&").replace("&quot;", '"')
+        m = re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"', html)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        logger.warning(f"Page scrape failed: {e}")
+    return ""
 
 
 class VideoService:
@@ -101,24 +105,31 @@ class VideoService:
         }
 
     async def _fetch_metadata(self, url: str) -> dict:
-        """Try yt-dlp first, fall back to YouTube Data API."""
+        """Try yt-dlp first, fall back to oEmbed + page scrape."""
         meta = await self._try_ytdlp(url)
         if meta:
             return meta
-        logger.warning("yt-dlp failed, trying YouTube API fallback")
-        api_meta = await _fetch_via_youtube_api(url)
+
+        logger.warning("yt-dlp failed, trying oEmbed fallback")
+        oembed = await _fetch_via_oembed(url)
+        if not oembed:
+            raise VideoIngestionError("yt-dlp failed and oEmbed fallback also failed")
+
+        video_id = _extract_video_id(url)
+        description = await _scrape_description(video_id) if video_id else ""
+
         return {
-            "title": api_meta["video_title"],
-            "channel": api_meta["channel"],
-            "duration": api_meta["duration"],
-            "description": api_meta.get("description", ""),
+            "title": oembed["title"],
+            "channel": oembed["channel"],
+            "duration": None,
+            "description": description,
         }
 
     async def _try_ytdlp(self, url: str) -> dict | None:
         cmd = [
             "yt-dlp", "--dump-json", "--skip-download", "--no-warnings",
             "--extractor-args", "youtube:player_client=tv,ios,android;skip=webpage",
-            "--user-agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36",
+            "--user-agent", MOBILE_UA,
             url,
         ]
         try:
@@ -145,8 +156,7 @@ class VideoService:
         parts = [
             f"Title: {title}",
             *([f"Channel: {channel}"] if channel else []),
-            f"Description:\n{description[:2000]}",
-            "(No subtitles available)",
+            f"Description:\n{description[:2000]}" if description else "(No description available)",
         ]
         prompt_text = "\n\n".join(parts)
 

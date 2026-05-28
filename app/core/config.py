@@ -5,7 +5,6 @@ class Settings(BaseSettings):
     POSTGRES_DB: str
     TEST_DATABASE_URL: str | None = None
     GEMINI_API_KEY: str
-    YOUTUBE_API_KEY: str | None = None
 
     DATABASE_ECHO_SQL: bool = False
     DATABASE_POOL_SIZE: int = 5
