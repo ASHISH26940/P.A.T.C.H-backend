@@ -133,6 +133,36 @@ async def get_memory(
     )
 
 
+class MemoryUpdate(BaseModel):
+    content: Optional[str] = None
+    memory_type: Optional[str] = None
+    importance: Optional[float] = Field(None, ge=0.0, le=1.0)
+
+
+@router.put("/memories/{memory_id}", response_model=MemoryResponse)
+async def update_memory(
+    memory_id: str,
+    update_data: MemoryUpdate,
+    service: MemoryService = Depends(get_memory_service),
+):
+    memory = await service.update_memory(
+        memory_id=memory_id,
+        content=update_data.content,
+        memory_type=update_data.memory_type,
+        importance=update_data.importance,
+    )
+    if not memory:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return MemoryResponse(
+        id=memory.id,
+        user_id=memory.user_id,
+        memory_type=memory.memory_type,
+        content=memory.content,
+        importance=memory.importance,
+        created_at=memory.created_at.isoformat() if memory.created_at else "",
+    )
+
+
 @router.delete("/memories/{memory_id}", status_code=204)
 async def delete_memory(
     memory_id: str,

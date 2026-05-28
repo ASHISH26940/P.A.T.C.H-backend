@@ -39,6 +39,25 @@ async def create_memory_link(
     )
 
 
+@router.get("/links", response_model=MemoryLinkListResponse)
+async def get_all_links_endpoint(
+    service: MemoryService = Depends(get_memory_service),
+):
+    links = await service.get_all_links()
+    return MemoryLinkListResponse(
+        links=[
+            MemoryLinkResponse(
+                id=l.id,
+                source_memory_id=l.source_memory_id,
+                target_memory_id=l.target_memory_id,
+                relationship=l.relationship,
+                created_at=l.created_at.isoformat(),
+            )
+            for l in links
+        ]
+    )
+
+
 @router.get("/links/{memory_id}", response_model=MemoryLinkListResponse)
 async def get_memory_links_endpoint(
     memory_id: str,

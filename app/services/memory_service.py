@@ -25,6 +25,14 @@ class MemoryService:
         metadata: Optional[dict] = None,
         importance: float = 0.5,
     ) -> Memory:
+        existing = await self.db.execute(
+            select(Memory).where(Memory.user_id == user_id, Memory.content == content).limit(1)
+        )
+        dup = existing.scalar_one_or_none()
+        if dup:
+            logger.info(f"Skipped duplicate memory for user {user_id} — content already exists as {dup.id}")
+            return dup
+
         embedding = None
         try:
             embedding = self.embedder.embed_documents([content])[0]
@@ -106,6 +114,23 @@ class MemoryService:
         except Exception:
             return None
 
+    async def update_memory(
+        self, memory_id: str, content: Optional[str] = None,
+        memory_type: Optional[str] = None, importance: Optional[float] = None,
+    ) -> Optional[Memory]:
+        memory = await self.db.get(Memory, memory_id)
+        if not memory:
+            return None
+        if content is not None:
+            memory.content = content
+        if memory_type is not None:
+            memory.memory_type = memory_type
+        if importance is not None:
+            memory.importance = importance
+        await self.db.commit()
+        await self.db.refresh(memory)
+        return memory
+
     async def delete_memory(self, memory_id: str) -> bool:
         memory = await self.db.get(Memory, memory_id)
         if not memory:
@@ -127,7 +152,14 @@ class MemoryService:
             .limit(limit)
         )
         result = await self.db.execute(stmt)
-        return list(result.scalars().all())
+        items = list(result.scalars().all())
+        seen = set()
+        deduped = []
+        for m in items:
+            if m.content in seen: continue
+            seen.add(m.content)
+            deduped.append(m)
+        return deduped
 
     async def get_important_memories(
         self, user_id: str, limit: int = 5
@@ -277,6 +309,10 @@ class MemoryService:
         await self.db.delete(ctx)
         await self.db.commit()
         return True
+
+    async def get_all_links(self) -> List[MemoryLink]:
+        result = await self.db.execute(select(MemoryLink))
+        return list(result.scalars().all())
 
     async def get_memory_links(
         self, memory_id: str, relationship: Optional[str] = None

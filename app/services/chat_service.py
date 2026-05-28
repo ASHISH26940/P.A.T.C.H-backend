@@ -1,51 +1,48 @@
 import uuid
 import re
-from typing import Optional
+import json
+from typing import AsyncGenerator
 from loguru import logger
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_core.language_models import BaseChatModel
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
+from google import genai
 
-from app.models.chat import ChatRequest, ChatResponse
-from app.core.llm_client import get_chat_llm
+from app.models.chat import ChatRequest
 from app.services.memory_service import MemoryService
 from app.core.config import settings
 
 
-class ChatService:
-    def __init__(
-        self,
-        memory_service: MemoryService,
-        llm: Optional[BaseChatModel] = None,
-    ):
-        self.memory_service = memory_service
-        self.llm = llm if llm else get_chat_llm()
-        self.output_parser = StrOutputParser()
+client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
-        self.system_prompt_template = """
-You are a helpful AI assistant for video creators. Be concise and specific.
+
+def _sse(event: str, data: dict) -> str:
+    return f"data: {json.dumps({'type': event, **data})}\n\n"
+
+
+def _build_prompt(memory_context: str, persona_name: str = "", persona_description: str = "") -> str:
+    persona_block = ""
+    if persona_name:
+        persona_block = f"\nYou are acting as {persona_name}."
+        if persona_description:
+            persona_block += f" {persona_description}"
+    return f"""You are a helpful AI assistant for video creators. Be concise and specific.{persona_block}
 
 {memory_context}
 
 After your response, if the user shared something worth remembering later, add each fact on its own line starting with 📝. Example:
 Your normal response here.
 📝 User prefers voiceover-style tutorials
-📝 They're working on a gaming channel
-"""
+📝 They're working on a gaming channel"""
 
-        self.prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", self.system_prompt_template),
-                MessagesPlaceholder(variable_name="messages"),
-            ]
-        )
 
-        self.chain = self.prompt | self.llm | self.output_parser
+class ChatService:
+    def __init__(self, memory_service: MemoryService):
+        self.memory_service = memory_service
 
-    async def process_chat_message(self, request: ChatRequest) -> ChatResponse:
+    async def process_chat_message_stream(
+        self, request: ChatRequest
+    ) -> AsyncGenerator[str, None]:
         user_id = request.user_id
         user_message = request.user_message
+        session_id = request.session_id
         message_id = str(uuid.uuid4())
 
         combined = []
@@ -77,55 +74,64 @@ Your normal response here.
         except Exception as e:
             logger.warning(f"Memory retrieval failed (continuing without context): {e}")
 
+        persona_name = request.persona_name or ""
+        persona_description = ""
+        if request.persona_id:
+            try:
+                from app.models.persona import Persona
+                from app.core.database import get_db
+                from sqlalchemy import select
+                result = await self.memory_service.db.execute(
+                    select(Persona).where(Persona.id == request.persona_id)
+                )
+                persona = result.scalar_one_or_none()
+                if persona:
+                    persona_description = persona.description or ""
+            except Exception:
+                pass
+
         chat_history = await self.memory_service.get_chat_history(
             user_id=user_id, limit=50
         )
 
-        system_message = SystemMessage(
-            content=self.system_prompt_template.format(
-                memory_context=memory_context
-            )
+        prompt = _build_prompt(
+            memory_context=memory_context,
+            persona_name=persona_name,
+            persona_description=persona_description,
         )
 
-        messages_for_llm = [system_message]
+        history_parts = []
+        for msg in chat_history[-20:]:
+            role = "user" if msg.role == "human" else "model"
+            history_parts.append(f"role: {role}\n{msg.content}")
 
-        token_budget = int(
-            settings.LLM_CONTEXT_WINDOW
-            * settings.LLM_TOKEN_THRESHOLD_PERCENTAGE
-            - settings.LLM_RESERVED_TOKENS_OUTPUT
-        )
-        system_tokens = len(system_message.content)
-        available = token_budget - system_tokens
+        full_prompt = f"{prompt}\n\n{'---'.join(history_parts)}\n\nrole: user\n{user_message}"
 
-        trimmed_history = []
-        for msg in reversed(chat_history):
-            msg_tokens = len(msg.content)
-            if available - msg_tokens > 0:
-                if msg.role == "human":
-                    trimmed_history.insert(0, HumanMessage(content=msg.content))
-                elif msg.role == "ai":
-                    trimmed_history.insert(0, AIMessage(content=msg.content))
-                available -= msg_tokens
-            else:
-                break
-
-        messages_for_llm.extend(trimmed_history)
-        messages_for_llm.append(HumanMessage(content=user_message))
-
+        chunks: list[str] = []
         try:
-            ai_response = await self.chain.ainvoke({
-                "messages": messages_for_llm,
-                "memory_context": memory_context,
-            })
+            stream = await client.aio.models.generate_content_stream(
+                model="gemma-4-26b-a4b-it",
+                contents=full_prompt,
+            )
+            async for chunk in stream:
+                if not chunk.candidates:
+                    continue
+                parts = chunk.candidates[0].content.parts
+                for p in parts:
+                    if hasattr(p, 'text') and p.text and not getattr(p, 'thought', False):
+                        chunks.append(p.text)
+                        yield _sse("token", {"text": p.text})
         except Exception as e:
-            logger.error(f"LLM invocation failed: {e}")
-            ai_response = "Sorry, I encountered an error processing your request."
+            logger.error(f"LLM stream failed: {e}")
+            yield _sse("error", {"text": "Sorry, I encountered an error processing your request."})
+            return
 
-        display_response = ai_response
-        extractions = re.findall(r"^📝 (.+)$", ai_response, re.MULTILINE)
+        full_response = "".join(chunks)
+        display_response = full_response
+
+        extractions = re.findall(r"^📝 (.+)$", full_response, re.MULTILINE)
         if extractions:
-            display_response = re.sub(r"\n?📝 .+", "", ai_response).strip()
-
+            display_response = re.sub(r"\n?📝 .+", "", full_response).strip()
             for item in extractions:
                 try:
                     await self.memory_service.add_memory(
@@ -135,21 +141,19 @@ Your normal response here.
                     )
                 except Exception as e:
                     logger.debug(f"Failed to store extraction: {e}")
-
             try:
                 await self.memory_service.add_extraction(
                     user_id=user_id, session_id=message_id,
                     source="chat", insights={"extractions": extractions},
                 )
-                logger.info(f"Stored {len(extractions)} extractions from {message_id}")
             except Exception as e:
                 logger.debug(f"Failed to log extraction event: {e}")
 
         await self.memory_service.add_chat_message(
-            user_id=user_id, role="human", content=user_message
+            user_id=user_id, role="human", content=user_message, session_id=session_id,
         )
         await self.memory_service.add_chat_message(
-            user_id=user_id, role="ai", content=display_response
+            user_id=user_id, role="ai", content=display_response, session_id=session_id,
         )
 
         await self.memory_service.add_memory(
@@ -160,12 +164,14 @@ Your normal response here.
             importance=0.3,
         )
 
-        return ChatResponse(
-            ai_response=display_response,
-            source_documents=[
+        human_count = len(chat_history) // 2 + 1
+
+        yield _sse("done", {
+            "message_id": message_id,
+            "source_documents": [
                 {"id": m.id, "content": m.content, "metadata": m.metadata_,
                  "type": m.memory_type, "importance": m.importance}
                 for m in combined
             ],
-            message_id=message_id,
-        )
+            "derivation_available": human_count >= 10,
+        })

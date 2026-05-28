@@ -12,17 +12,17 @@ class VideoIngestionError(Exception):
     pass
 
 
-SYSTEM_PROMPT = """You are a video analysis assistant for creators. Given a video's title, channel, duration, and description, extract actionable insights the creator would want to remember.
+SYSTEM_PROMPT = """You are a video analysis assistant for creators. Given a video's title, channel, duration, and description, extract EVERY actionable insight the creator would want to remember. Be exhaustive — extract as many useful pieces as you can find.
 
 For each insight, output a line starting with 📝 followed by:
-- The insight content (what's worth remembering)
-- The type of insight (tip, idea, reference, technique, tool, quote, concept)
+- The insight content (what's worth remembering, be specific)
+- The type of insight (tip, idea, reference, technique, tool, quote, concept, framework, statistic, principle, tactic, example)
 - An importance score from 0.0 to 1.0
 
 Format each line as:
 📝 content | type | importance
 
-Only output 📝 lines for genuinely useful information. Skip fluff, sponsor segments, and filler."""
+Extract aggressively. Every specific technique, named framework, quoted statistic, referenced book/tool/person, mental model, or tactical step should be its own 📝 line. Break compound ideas into separate lines. Don't summarize — atomize."""
 
 
 class VideoService:
@@ -34,10 +34,15 @@ class VideoService:
     async def ingest(self, user_id: str, url: str) -> dict:
         logger.info(f"Ingesting video for user {user_id}: {url}")
 
-        result = subprocess.run(
-            ["yt-dlp", "--dump-json", "--skip-download", url],
-            capture_output=True, text=True, timeout=60,
-        )
+        try:
+            result = subprocess.run(
+                ["yt-dlp", "--dump-json", "--skip-download", "--no-warnings",
+                 "--extractor-args", "youtube:skip=webpage;player_client=android",
+                 url],
+                capture_output=True, text=True, timeout=60,
+            )
+        except FileNotFoundError:
+            raise VideoIngestionError("yt-dlp not installed")
         if result.returncode != 0:
             raise VideoIngestionError(f"yt-dlp failed: {result.stderr.strip()}")
         meta = json.loads(result.stdout)

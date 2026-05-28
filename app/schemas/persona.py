@@ -24,14 +24,19 @@ class PersonaUpdate(BaseModel):
     traits: Optional[List[str]] = None
     goals: Optional[List[str]] = None
 
+class DerivedPersonaSuggestion(BaseModel):
+    """Schema for a persona automatically derived from chat history analysis."""
+    name: str = Field(..., description="Suggested persona name")
+    description: str = Field(..., description="Why this persona emerged and what it represents")
+    traits: List[str] = Field(..., description="Identified traits/characteristics")
+    goals: List[str] = Field(..., description="Goals this persona pursues")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score 0-1")
+    sample_messages: List[str] = Field(..., max_length=5, description="Representative messages that define this cluster")
+    message_count: int = Field(..., ge=1, description="Number of messages in this cluster")
+
 class PersonaInDB(PersonaBase):
-    """Schema for Persona as stored in the database (output model for GET/POST responses)."""
     id: uuid.UUID = Field(..., description="Unique identifier of the persona")
-    # created_at: datetime = Field(default_factory=datetime.utcnow) # Example timestamp
-    # updated_at: datetime = Field(default_factory=datetime.utcnow) # Example timestamp
+    user_id: str = Field(..., description="Owner of this persona")
 
     class Config:
-        # This tells Pydantic to read data from ORM models (e.g., SQLAlchemy)
-        # by attribute name (e.g., my_model.id) rather than dictionary keys (e.g., my_dict['id']).
-        # Essential if you ever use SQLAlchemy ORM models with these Pydantic schemas.
-        from_attributes = True # For Pydantic v2.x (previously orm_mode = True in v1.x)
+        from_attributes = True

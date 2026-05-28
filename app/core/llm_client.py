@@ -5,7 +5,7 @@ from loguru import logger
 
 try:
     logger.info(settings.GEMINI_API_KEY)
-    chat_llm=ChatGoogleGenerativeAI(model="gemini-3.5-flash", google_api_key=settings.GEMINI_API_KEY, temperature=0.7)
+    chat_llm=ChatGoogleGenerativeAI(model="gemma-4-26b-a4b-it", google_api_key=settings.GEMINI_API_KEY, temperature=0.7)
     embeddings_models=GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", google_api_key=settings.GEMINI_API_KEY)
     logger.info("Google Gemini llm and embeddings models initialized")
 except Exception as e:
