@@ -17,7 +17,10 @@ async def init_db():
         logger.info("Database engine already initialized.")
         return
     
-    server_url = settings.DATABASE_URL
+    raw_url = settings.DATABASE_URL
+    if raw_url.startswith("postgresql://") and "+asyncpg" not in raw_url:
+        raw_url = raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    server_url = raw_url
 
     max_retries=10
     retry_delay=5
