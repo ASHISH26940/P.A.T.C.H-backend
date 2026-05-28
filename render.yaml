@@ -1,11 +1,11 @@
-services:
-  # PostgreSQL Database with pgvector
-  - type: pserv
-    name: patch-postgres
+databases:
+  - name: patch-postgres
+    databaseName: patched
     plan: free
     region: oregon
+    postgresMajorVersion: 16
 
-  # FastAPI Backend Application
+services:
   - type: web
     name: patch-backend
     runtime: docker
@@ -14,17 +14,12 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /v1/health
     envVars:
-      # Database Configuration
       - key: DATABASE_URL
         fromDatabase:
           name: patch-postgres
           property: connectionString
       - key: POSTGRES_DB
-        fromDatabase:
-          name: patch-postgres
-          property: database
-
-      # Security - IMPORTANT: Set GEMINI_API_KEY in Render dashboard
+        value: patched
       - key: GEMINI_API_KEY
         sync: false
       - key: SECRET_KEY
@@ -33,7 +28,5 @@ services:
         value: HS256
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
         value: "1440"
-
-      # Application Environment
       - key: ENVIRONMENT
         value: production
