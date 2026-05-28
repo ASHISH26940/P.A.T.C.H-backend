@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine,async_sessionmaker,AsyncSession
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column
-from sqlalchemy import text, Column, Integer, String, Boolean, Text
+from sqlalchemy import text, Column, Integer, String, Boolean
 from app.core.config import settings
 from loguru import logger
 import asyncio
@@ -95,7 +95,6 @@ class User(Base):
     email:Mapped[Optional[str]]=mapped_column(String,unique=True,index=True,nullable=True)
     hashed_password:Mapped[str]=mapped_column(String)
     is_active:Mapped[bool]=mapped_column(Boolean,default=True)
-    youtube_cookies:Mapped[Optional[str]]=mapped_column(Text,nullable=True)
 
     def __repr__(self):
         return f"<User(id={self.id}, username='{self.username}', email='{self.email}')>"

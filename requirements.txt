@@ -22,6 +22,7 @@ email-validator==2.3.0
 # Utilities
 loguru==0.7.3
 typing-extensions>=4.10.0
+isodate>=0.7.2
 
 # Testing
 pytest>=8.0.0

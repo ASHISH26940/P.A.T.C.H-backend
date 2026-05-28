@@ -18,7 +18,7 @@ async def ingest_video(
 ):
     service = VideoService(db=db)
     try:
-        result = await service.ingest(current_user.username, request.url, current_user.youtube_cookies)
+        result = await service.ingest(current_user.username, request.url)
     except VideoIngestionError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

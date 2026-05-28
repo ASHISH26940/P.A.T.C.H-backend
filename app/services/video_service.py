@@ -2,9 +2,12 @@ import subprocess
 import json
 import tempfile
 import os
+import httpx
+import re
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
+from app.core.config import settings
 from app.core.llm_client import get_chat_llm
 from app.services.memory_service import MemoryService
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -27,57 +30,121 @@ Format each line as:
 Extract aggressively. Every specific technique, named framework, quoted statistic, referenced book/tool/person, mental model, or tactical step should be its own 📝 line. Break compound ideas into separate lines. Don't summarize — atomize."""
 
 
+def _extract_video_id(url: str) -> str | None:
+    m = re.search(r"(?:v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/|youtube\.com/v/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
+
+
+async def _fetch_via_youtube_api(url: str) -> dict:
+    """Fallback: fetch video metadata via YouTube Data API v3."""
+    video_id = _extract_video_id(url)
+    if not video_id:
+        raise VideoIngestionError("Could not extract video ID from URL")
+    if not settings.YOUTUBE_API_KEY:
+        raise VideoIngestionError("YouTube API key not configured")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
+                "part": "snippet,contentDetails",
+                "id": video_id,
+                "key": settings.YOUTUBE_API_KEY,
+            },
+        )
+    if resp.status_code != 200:
+        raise VideoIngestionError(f"YouTube API returned {resp.status_code}: {resp.text}")
+
+    data = resp.json()
+    items = data.get("items", [])
+    if not items:
+        raise VideoIngestionError("Video not found on YouTube")
+
+    snippet = items[0]["snippet"]
+    duration_iso = items[0]["contentDetails"]["duration"]
+    import isodate
+    duration_seconds = int(isodate.parse_duration(duration_iso).total_seconds())
+
+    return {
+        "video_title": snippet["title"],
+        "channel": snippet["channelTitle"],
+        "duration": duration_seconds,
+        "subtitles_available": False,
+        "description": snippet.get("description", ""),
+    }
+
+
 class VideoService:
     def __init__(self, db: AsyncSession):
         self.db = db
         self.memory_service = MemoryService(db)
         self.llm = get_chat_llm()
 
-    async def ingest(self, user_id: str, url: str, cookies: str | None = None) -> dict:
+    async def ingest(self, user_id: str, url: str) -> dict:
         logger.info(f"Ingesting video for user {user_id}: {url}")
 
-        cmd = [
-            "yt-dlp", "--dump-json", "--skip-download", "--no-warnings",
-            "--extractor-args", "youtube:player_client=android,web",
-            "--user-agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36",
-        ]
-
-        cookies_path = None
-        if cookies and cookies.strip():
-            try:
-                f = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
-                f.write(cookies)
-                f.close()
-                cookies_path = f.name
-                cmd.extend(["--cookies", cookies_path])
-            except Exception as e:
-                logger.warning(f"Failed to write cookies temp file: {e}")
-
-        cmd.append(url)
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        except FileNotFoundError:
-            raise VideoIngestionError("yt-dlp not installed")
-        finally:
-            if cookies_path:
-                try:
-                    os.unlink(cookies_path)
-                except OSError:
-                    pass
-        if result.returncode != 0:
-            raise VideoIngestionError(f"yt-dlp failed: {result.stderr.strip()}")
-        meta = json.loads(result.stdout)
+        meta = await self._fetch_metadata(url)
 
         title = meta.get("title", "Unknown")
-        channel = meta.get("channel", meta.get("uploader", None))
+        channel = meta.get("channel", None)
         duration = meta.get("duration", None)
         description = meta.get("description", "")
 
+        memories = await self._extract_memories(user_id, url, title, channel, description)
+
+        return {
+            "video_title": title,
+            "channel": channel,
+            "duration": duration,
+            "subtitles_available": False,
+            "memories": memories,
+        }
+
+    async def _fetch_metadata(self, url: str) -> dict:
+        """Try yt-dlp first, fall back to YouTube Data API."""
+        meta = await self._try_ytdlp(url)
+        if meta:
+            return meta
+        logger.warning("yt-dlp failed, trying YouTube API fallback")
+        api_meta = await _fetch_via_youtube_api(url)
+        return {
+            "title": api_meta["video_title"],
+            "channel": api_meta["channel"],
+            "duration": api_meta["duration"],
+            "description": api_meta.get("description", ""),
+        }
+
+    async def _try_ytdlp(self, url: str) -> dict | None:
+        cmd = [
+            "yt-dlp", "--dump-json", "--skip-download", "--no-warnings",
+            "--extractor-args", "youtube:player_client=tv,ios,android;skip=webpage",
+            "--user-agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36",
+            url,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except FileNotFoundError:
+            logger.warning("yt-dlp not installed")
+            return None
+        if result.returncode != 0:
+            logger.warning(f"yt-dlp failed: {result.stderr.strip()}")
+            return None
+        try:
+            meta = json.loads(result.stdout)
+            return {
+                "title": meta.get("title", "Unknown"),
+                "channel": meta.get("channel", meta.get("uploader", None)),
+                "duration": meta.get("duration", None),
+                "description": meta.get("description", ""),
+            }
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"yt-dlp parse error: {e}")
+            return None
+
+    async def _extract_memories(self, user_id: str, url: str, title: str, channel: str | None, description: str) -> list[dict]:
         parts = [
             f"Title: {title}",
             *([f"Channel: {channel}"] if channel else []),
-            *([f"Duration: {duration}s"] if duration else []),
             f"Description:\n{description[:2000]}",
             "(No subtitles available)",
         ]
@@ -126,10 +193,4 @@ class VideoService:
                 "importance": memory.importance,
             })
 
-        return {
-            "video_title": title,
-            "channel": channel,
-            "duration": duration,
-            "subtitles_available": False,
-            "memories": memories,
-        }
+        return memories
