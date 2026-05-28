@@ -24,7 +24,9 @@ For each insight, output a line starting with 📝 followed by:
 Format each line as:
 📝 content | type | importance
 
-Extract aggressively. Every specific technique, named framework, quoted statistic, referenced book/tool/person, mental model, or tactical step should be its own 📝 line. Break compound ideas into separate lines. Don't summarize — atomize."""
+Extract aggressively. Every specific technique, named framework, quoted statistic, referenced book/tool/person, mental model, or tactical step should be its own 📝 line. Break compound ideas into separate lines. Don't summarize — atomize.
+
+If the description is missing or minimal, infer insights from the title alone — what a creator watching this would take away: themes, techniques implied, concepts referenced, actionable takeaways. Always produce at least 3-5 insights even with minimal information."""
 
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36"
 
@@ -59,20 +61,27 @@ async def _fetch_via_oembed(url: str) -> dict | None:
 async def _scrape_description(video_id: str) -> str:
     """Try to extract video description from page meta tags."""
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             resp = await client.get(
                 f"https://www.youtube.com/watch?v={video_id}",
                 headers={"User-Agent": MOBILE_UA},
             )
         if resp.status_code != 200:
+            logger.warning(f"Page scrape returned {resp.status_code}")
             return ""
         html = resp.text
-        m = re.search(r'<meta\s+name="description"\s+content="([^"]+)"', html)
-        if m:
-            return m.group(1).replace("&#39;", "'").replace("&amp;", "&").replace("&quot;", '"')
-        m = re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"', html)
-        if m:
-            return m.group(1)
+        patterns = [
+            r'<meta\s+name="description"\s+content="([^"]+)"',
+            r'<meta\s+property="og:description"\s+content="([^"]+)"',
+            r'"description":"([^"]+)"',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html)
+            if m:
+                desc = m.group(1).replace("&#39;", "'").replace("&amp;", "&").replace("&quot;", '"').replace("&#10;", "\n")
+                if len(desc) > 20:
+                    return desc
+        return ""
     except Exception as e:
         logger.warning(f"Page scrape failed: {e}")
     return ""
@@ -173,6 +182,8 @@ class VideoService:
             )
         else:
             output = str(raw)
+
+        logger.info(f"LLM output lines: {len(output.splitlines())}, first 200 chars: {output[:200]}")
 
         memories = []
         for line in output.splitlines():
