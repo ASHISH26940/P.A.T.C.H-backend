@@ -37,7 +37,8 @@ class VideoService:
         try:
             result = subprocess.run(
                 ["yt-dlp", "--dump-json", "--skip-download", "--no-warnings",
-                 "--extractor-args", "youtube:skip=webpage;player_client=android",
+                 "--extractor-args", "youtube:player_client=android,web",
+                 "--user-agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36",
                  url],
                 capture_output=True, text=True, timeout=60,
             )
