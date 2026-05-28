@@ -1,5 +1,7 @@
 import subprocess
 import json
+import tempfile
+import os
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
@@ -31,19 +33,38 @@ class VideoService:
         self.memory_service = MemoryService(db)
         self.llm = get_chat_llm()
 
-    async def ingest(self, user_id: str, url: str) -> dict:
+    async def ingest(self, user_id: str, url: str, cookies: str | None = None) -> dict:
         logger.info(f"Ingesting video for user {user_id}: {url}")
 
+        cmd = [
+            "yt-dlp", "--dump-json", "--skip-download", "--no-warnings",
+            "--extractor-args", "youtube:player_client=android,web",
+            "--user-agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36",
+        ]
+
+        cookies_path = None
+        if cookies and cookies.strip():
+            try:
+                f = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+                f.write(cookies)
+                f.close()
+                cookies_path = f.name
+                cmd.extend(["--cookies", cookies_path])
+            except Exception as e:
+                logger.warning(f"Failed to write cookies temp file: {e}")
+
+        cmd.append(url)
+
         try:
-            result = subprocess.run(
-                ["yt-dlp", "--dump-json", "--skip-download", "--no-warnings",
-                 "--extractor-args", "youtube:player_client=android,web",
-                 "--user-agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36",
-                 url],
-                capture_output=True, text=True, timeout=60,
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         except FileNotFoundError:
             raise VideoIngestionError("yt-dlp not installed")
+        finally:
+            if cookies_path:
+                try:
+                    os.unlink(cookies_path)
+                except OSError:
+                    pass
         if result.returncode != 0:
             raise VideoIngestionError(f"yt-dlp failed: {result.stderr.strip()}")
         meta = json.loads(result.stdout)
