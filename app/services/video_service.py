@@ -1,5 +1,7 @@
 import subprocess
 import json
+import httpx
+import re
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
@@ -24,6 +26,57 @@ Format each line as:
 
 Extract aggressively. Every specific technique, named framework, quoted statistic, referenced book/tool/person, mental model, or tactical step should be its own 📝 line. Break compound ideas into separate lines. Don't summarize — atomize."""
 
+MOBILE_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36"
+
+
+def _extract_video_id(url: str) -> str | None:
+    m = re.search(r"(?:v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/|youtube\.com/v/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
+
+
+async def _fetch_via_oembed(url: str) -> dict | None:
+    """Fallback: YouTube oEmbed API — no key required."""
+    video_id = _extract_video_id(url)
+    if not video_id:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://www.youtube.com/oembed",
+                params={"url": f"https://www.youtube.com/watch?v={video_id}", "format": "json"},
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            return {
+                "title": data.get("title", "Unknown"),
+                "channel": data.get("author_name", None),
+            }
+    except Exception as e:
+        logger.warning(f"oEmbed failed: {e}")
+    return None
+
+
+async def _scrape_description(video_id: str) -> str:
+    """Try to extract video description from page meta tags."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"https://www.youtube.com/watch?v={video_id}",
+                headers={"User-Agent": MOBILE_UA},
+            )
+        if resp.status_code != 200:
+            return ""
+        html = resp.text
+        m = re.search(r'<meta\s+name="description"\s+content="([^"]+)"', html)
+        if m:
+            return m.group(1).replace("&#39;", "'").replace("&amp;", "&").replace("&quot;", '"')
+        m = re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"', html)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        logger.warning(f"Page scrape failed: {e}")
+    return ""
+
 
 class VideoService:
     def __init__(self, db: AsyncSession):
@@ -34,30 +87,76 @@ class VideoService:
     async def ingest(self, user_id: str, url: str) -> dict:
         logger.info(f"Ingesting video for user {user_id}: {url}")
 
-        try:
-            result = subprocess.run(
-                ["yt-dlp", "--dump-json", "--skip-download", "--no-warnings",
-                 "--extractor-args", "youtube:skip=webpage;player_client=android",
-                 url],
-                capture_output=True, text=True, timeout=60,
-            )
-        except FileNotFoundError:
-            raise VideoIngestionError("yt-dlp not installed")
-        if result.returncode != 0:
-            raise VideoIngestionError(f"yt-dlp failed: {result.stderr.strip()}")
-        meta = json.loads(result.stdout)
+        meta = await self._fetch_metadata(url)
 
         title = meta.get("title", "Unknown")
-        channel = meta.get("channel", meta.get("uploader", None))
+        channel = meta.get("channel", None)
         duration = meta.get("duration", None)
         description = meta.get("description", "")
 
+        memories = await self._extract_memories(user_id, url, title, channel, description)
+
+        return {
+            "video_title": title,
+            "channel": channel,
+            "duration": duration,
+            "subtitles_available": False,
+            "memories": memories,
+        }
+
+    async def _fetch_metadata(self, url: str) -> dict:
+        """Try yt-dlp first, fall back to oEmbed + page scrape."""
+        meta = await self._try_ytdlp(url)
+        if meta:
+            return meta
+
+        logger.warning("yt-dlp failed, trying oEmbed fallback")
+        oembed = await _fetch_via_oembed(url)
+        if not oembed:
+            raise VideoIngestionError("yt-dlp failed and oEmbed fallback also failed")
+
+        video_id = _extract_video_id(url)
+        description = await _scrape_description(video_id) if video_id else ""
+
+        return {
+            "title": oembed["title"],
+            "channel": oembed["channel"],
+            "duration": None,
+            "description": description,
+        }
+
+    async def _try_ytdlp(self, url: str) -> dict | None:
+        cmd = [
+            "yt-dlp", "--dump-json", "--skip-download", "--no-warnings",
+            "--extractor-args", "youtube:player_client=tv,ios,android;skip=webpage",
+            "--user-agent", MOBILE_UA,
+            url,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except FileNotFoundError:
+            logger.warning("yt-dlp not installed")
+            return None
+        if result.returncode != 0:
+            logger.warning(f"yt-dlp failed: {result.stderr.strip()}")
+            return None
+        try:
+            meta = json.loads(result.stdout)
+            return {
+                "title": meta.get("title", "Unknown"),
+                "channel": meta.get("channel", meta.get("uploader", None)),
+                "duration": meta.get("duration", None),
+                "description": meta.get("description", ""),
+            }
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"yt-dlp parse error: {e}")
+            return None
+
+    async def _extract_memories(self, user_id: str, url: str, title: str, channel: str | None, description: str) -> list[dict]:
         parts = [
             f"Title: {title}",
             *([f"Channel: {channel}"] if channel else []),
-            *([f"Duration: {duration}s"] if duration else []),
-            f"Description:\n{description[:2000]}",
-            "(No subtitles available)",
+            f"Description:\n{description[:2000]}" if description else "(No description available)",
         ]
         prompt_text = "\n\n".join(parts)
 
@@ -104,10 +203,4 @@ class VideoService:
                 "importance": memory.importance,
             })
 
-        return {
-            "video_title": title,
-            "channel": channel,
-            "duration": duration,
-            "subtitles_available": False,
-            "memories": memories,
-        }
+        return memories
