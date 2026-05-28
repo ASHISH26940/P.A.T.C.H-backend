@@ -1,293 +1,177 @@
-# app/services/chat_service.py
-
-from typing import Dict, Any, List, Optional
-from loguru import logger
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_core.language_models import BaseChatModel
-from langchain_core.runnables import RunnableLambda
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
-
-from app.models.chat import ChatRequest, ChatResponse
-from app.models.document import Document, DocumentQueryResult # Ensure this is imported
-from app.core.llm_client import get_chat_llm
-from app.services.vector_store import VectorStoreService
-from app.services.context_injector import ContextInjectorService
-from app.core.config import settings # Import settings for thresholds
 import uuid
-from datetime import datetime,timezone
+import re
+import json
+from typing import AsyncGenerator
+from loguru import logger
+from google import genai
+
+from app.models.chat import ChatRequest
+from app.services.memory_service import MemoryService
+from app.core.config import settings
+
+
+client = genai.Client(api_key=settings.GEMINI_API_KEY)
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"data: {json.dumps({'type': event, **data})}\n\n"
+
+
+def _build_prompt(memory_context: str, persona_name: str = "", persona_description: str = "") -> str:
+    persona_block = ""
+    if persona_name:
+        persona_block = f"\nYou are acting as {persona_name}."
+        if persona_description:
+            persona_block += f" {persona_description}"
+    return f"""You are a helpful AI assistant for video creators. Be concise and specific.{persona_block}
+
+{memory_context}
+
+After your response, if the user shared something worth remembering later, add each fact on its own line starting with 📝. Example:
+Your normal response here.
+📝 User prefers voiceover-style tutorials
+📝 They're working on a gaming channel"""
+
 
 class ChatService:
-    def __init__(
-        self,
-        vector_store_service: VectorStoreService,
-        context_injector_service: ContextInjectorService,
-        llm: Optional[BaseChatModel] = None,
-    ):
-        self.vector_store_service = vector_store_service
-        self.context_injector_service = context_injector_service
-        self.llm = llm if llm else get_chat_llm()
-        self.output_parser = StrOutputParser()
+    def __init__(self, memory_service: MemoryService):
+        self.memory_service = memory_service
 
-        # Define the system prompt for the LLM
-        # Removed {rag_context} from system prompt as Layer 1 will be appended to HumanMessage
-        # Other RAG layers (General, Cognitive) will still use rag_context.
-        self.system_prompt_template = """
-        You are a helpful and knowledgeable AI assistant. Your goal is to provide accurate and concise answers based on the provided context.
-        If the answer cannot be found in the context, politely state that you don't know or that the information is not available in the provided documents.
-        Avoid making up information. Maintain a consistent persona. Be concise and to the point.
-
-        {general_rag_context}
-        {history_context}
-        {cognitive_context}
-        """
-
-        # Initialize the prompt template
-        self.prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", self.system_prompt_template),
-                MessagesPlaceholder(variable_name="messages"),
-            ]
-        )
-
-        # Build the RAG chain (simplified for this example)
-        self.rag_chain = self.prompt | self.llm | self.output_parser
-
-    async def process_chat_message(self, request: ChatRequest) -> ChatResponse:
+    async def process_chat_message_stream(
+        self, request: ChatRequest
+    ) -> AsyncGenerator[str, None]:
         user_id = request.user_id
-        user_message_content = request.user_message
-        collection_name = request.collection_name
-        message_id = str(uuid.uuid4()) # Generate a unique ID for this message
+        user_message = request.user_message
+        session_id = request.session_id
+        message_id = str(uuid.uuid4())
 
-        logger.info(f"Processing chat message for user '{user_id}' in collection '{collection_name}'")
-
-        all_source_documents_for_response: List[DocumentQueryResult] = []
-        
-        # New list to hold formatted past AI responses for prepending to human message
-        past_ai_responses_for_prepend: List[str] = []
-        
-        # --- Layer 1: User's Past Questions & Answers (Vector Store) ---
-        user_qa_collection_name = f"user_past_questions_answers"
+        combined = []
+        memory_context = ""
         try:
-            logger.debug(f"Attempting to retrieve past Q&A for user '{user_id}' with threshold {settings.CHROMA_PAST_QA_SIMILARITY_THRESHOLD}")
-            past_qa_documents = await self.vector_store_service.query_documents(
-                user_qa_collection_name,
-                user_message_content,
-                n_results=settings.CHROMA_PAST_QA_N_RESULTS,
-                min_similarity_score=settings.CHROMA_PAST_QA_SIMILARITY_THRESHOLD
+            important_memories = await self.memory_service.get_important_memories(
+                user_id=user_id, limit=3
             )
-            if past_qa_documents:
-                logger.info(f"Found {len(past_qa_documents)} past Q&A documents for user '{user_id}'.")
-                for doc in past_qa_documents:
-                    # Parse timestamp and format it
-                    timestamp_str = doc.document.metadata.get('timestamp')
-                    formatted_date = "unknown date"
-                    if timestamp_str:
-                        try:
-                            # Assuming ISO format like '2025-06-23T20:16:05.920+00:00'
-                            dt_object = datetime.fromisoformat(timestamp_str)
-                            # Format to a more human-readable date, e.g., "June 23, 2025"
-                            formatted_date = dt_object.strftime("%B %d, %Y")
-                        except ValueError:
-                            logger.warning(f"Could not parse timestamp '{timestamp_str}' for past AI response.")
-                    
-                    # Prepare the string for prepending to the human message
-                    past_ai_responses_for_prepend.append(
-                        f"AI's past response on {formatted_date}: {doc.document.content}"
-                    )
-                    logger.debug(f"Prepared past AI response for prepend: {past_ai_responses_for_prepend[-1]}")
-                all_source_documents_for_response.extend(past_qa_documents)
-            else:
-                logger.info("No similar past question found above threshold.")
-        except Exception as e:
-            logger.warning(f"Failed to retrieve past Q&A for user '{user_id}': {e}")
-        
-        # --- Prepare General RAG context (from Layer 2 and 4, as Layer 1 is now prepended) ---
-        general_rag_context_parts = []
-
-        # --- Layer 2: General Knowledge Base (Vector Store) ---
-        try:
-            logger.debug(f"Attempting to retrieve general knowledge documents for collection '{collection_name}' with threshold {settings.CHROMA_GENERAL_SIMILARITY_THRESHOLD}")
-            general_documents = await self.vector_store_service.query_documents(
-                collection_name,
-                user_message_content,
-                n_results=settings.CHROMA_GENERAL_N_RESULTS,
-                min_similarity_score=settings.CHROMA_GENERAL_SIMILARITY_THRESHOLD
+            relevant_memories = await self.memory_service.search_memories(
+                user_id=user_id,
+                query=user_message,
+                n_results=settings.MEMORY_N_RESULTS,
+                min_similarity=settings.MEMORY_SIMILARITY_THRESHOLD,
             )
-            if general_documents:
-                logger.info(f"Found {len(general_documents)} general documents for collection '{collection_name}'.")
-                general_rag_context_parts.append("### General Knowledge:\n")
-                for doc in general_documents:
-                    general_rag_context_parts.append(f"- {doc.document.content}\n")
-                all_source_documents_for_response.extend(general_documents)
-            else:
-                logger.info("No general documents retrieved for RAG.")
+
+            seen_ids = {m.id for m in relevant_memories}
+            combined = list(relevant_memories)
+            for m in important_memories:
+                if m.id not in seen_ids:
+                    combined.append(m)
+                    seen_ids.add(m.id)
+
+            memory_context_parts = []
+            for mem in combined:
+                memory_context_parts.append(f"[{mem.memory_type}] {mem.content}")
+            memory_context = (
+                "\n".join(memory_context_parts) if memory_context_parts else ""
+            )
         except Exception as e:
-            logger.warning(f"Failed to retrieve general knowledge for collection '{collection_name}': {e}")
+            logger.warning(f"Memory retrieval failed (continuing without context): {e}")
 
-
-        # --- Layer 3: Historical Context Retrieval (Redis/Long-term memory keywords) ---
-        history_context_str = ""
-        keywords_for_historical_context = ["yesterday", "last time", "previous conversation", "memory", "remember", "before", "information", "informations"]
-        if any(keyword in user_message_content.lower() for keyword in keywords_for_historical_context):
+        persona_name = request.persona_name or ""
+        persona_description = ""
+        if request.persona_id:
             try:
-                logger.debug(f"Keywords detected for Historical Context. Attempting to retrieve long-term memory for user '{user_id}'.")
-                # Assuming you have a collection for user's long-term memory/summaries
-                user_long_term_memory_collection = f"user_long_term_memory"
-                historical_documents = await self.vector_store_service.query_documents(
-                    user_long_term_memory_collection,
-                    user_message_content,
-                    n_results=settings.CHROMA_HISTORY_N_RESULTS,
-                    min_similarity_score=settings.CHROMA_HISTORY_SIMILARITY_THRESHOLD
+                from app.models.persona import Persona
+                from app.core.database import get_db
+                from sqlalchemy import select
+                result = await self.memory_service.db.execute(
+                    select(Persona).where(Persona.id == request.persona_id)
                 )
-                if historical_documents:
-                    logger.info(f"Found {len(historical_documents)} historical context documents for user '{user_id}'.")
-                    history_context_str = "### Historical Context (Long-Term Memory):\n"
-                    for doc in historical_documents:
-                        history_context_str += f"- {doc.document.content}\n"
-                    all_source_documents_for_response.extend(historical_documents)
-                else:
-                    logger.info("No historical context documents retrieved from long-term memory.")
+                persona = result.scalar_one_or_none()
+                if persona:
+                    persona_description = persona.description or ""
+            except Exception:
+                pass
+
+        chat_history = await self.memory_service.get_chat_history(
+            user_id=user_id, limit=50
+        )
+
+        prompt = _build_prompt(
+            memory_context=memory_context,
+            persona_name=persona_name,
+            persona_description=persona_description,
+        )
+
+        history_parts = []
+        for msg in chat_history[-20:]:
+            role = "user" if msg.role == "human" else "model"
+            history_parts.append(f"role: {role}\n{msg.content}")
+
+        full_prompt = f"{prompt}\n\n{'---'.join(history_parts)}\n\nrole: user\n{user_message}"
+
+        chunks: list[str] = []
+        try:
+            stream = await client.aio.models.generate_content_stream(
+                model="gemma-4-26b-a4b-it",
+                contents=full_prompt,
+            )
+            async for chunk in stream:
+                if not chunk.candidates:
+                    continue
+                parts = chunk.candidates[0].content.parts
+                for p in parts:
+                    if hasattr(p, 'text') and p.text and not getattr(p, 'thought', False):
+                        chunks.append(p.text)
+                        yield _sse("token", {"text": p.text})
+        except Exception as e:
+            logger.error(f"LLM stream failed: {e}")
+            yield _sse("error", {"text": "Sorry, I encountered an error processing your request."})
+            return
+
+        full_response = "".join(chunks)
+        display_response = full_response
+
+        extractions = re.findall(r"^📝 (.+)$", full_response, re.MULTILINE)
+        if extractions:
+            display_response = re.sub(r"\n?📝 .+", "", full_response).strip()
+            for item in extractions:
+                try:
+                    await self.memory_service.add_memory(
+                        user_id=user_id, content=item.strip(),
+                        memory_type="extraction", importance=0.6,
+                        metadata={"source_message_id": message_id},
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to store extraction: {e}")
+            try:
+                await self.memory_service.add_extraction(
+                    user_id=user_id, session_id=message_id,
+                    source="chat", insights={"extractions": extractions},
+                )
             except Exception as e:
-                logger.warning(f"Failed to retrieve historical context for user '{user_id}': {e}")
-        else:
-            logger.info("No keywords detected for Historical Context. Skipping long-term memory retrieval.")
+                logger.debug(f"Failed to log extraction event: {e}")
 
-        # --- Layer 4: Cognitive Knowledge Base (Vector Store) ---
-        cognitive_context_str = ""
-        try:
-            logger.debug(f"Attempting to retrieve cognitive knowledge documents for user '{user_id}'.")
-            cognitive_knowledge_collection = f"cognitive_knowledge_base" # A general cognitive base for all users
-            cognitive_documents = await self.vector_store_service.query_documents(
-                cognitive_knowledge_collection,
-                user_message_content,
-                n_results=settings.CHROMA_COGNITIVE_N_RESULTS,
-                min_similarity_score=settings.CHROMA_COGNITIVE_SIMILARITY_THRESHOLD
-            )
-            if cognitive_documents:
-                logger.info(f"Found {len(cognitive_documents)} cognitive knowledge documents.")
-                cognitive_context_str = "### Cognitive Knowledge:\n"
-                for doc in cognitive_documents:
-                    cognitive_context_str += f"- {doc.document.content}\n"
-                all_source_documents_for_response.extend(cognitive_documents)
-            else:
-                logger.info("No cognitive knowledge documents retrieved.")
-        except Exception as e:
-            logger.warning(f"Failed to retrieve cognitive knowledge: {e}")
-
-        general_rag_context = "\n".join(general_rag_context_parts) if general_rag_context_parts else "No specific RAG context provided."
-        
-        # Determine if any RAG or historical/cognitive context was generated
-        if not general_rag_context_parts and not history_context_str and not cognitive_context_str and not past_ai_responses_for_prepend:
-            logger.info("No significant RAG or historical/cognitive context generated.")
-
-
-        # --- Prepare messages for LLM (including chat history from Redis) ---
-        full_chat_history_from_redis = await self.context_injector_service.get_chat_history(user_id)
-        logger.info(f"Fetched {len(full_chat_history_from_redis)} messages from Redis for token management.")
-
-        # Construct messages for the LLM, ensuring token limits are respected
-        messages_for_llm = []
-        # The system message is constructed with the RAG/history/cognitive context
-        system_message_content = self.system_prompt_template.format(
-            general_rag_context=general_rag_context, # Renamed from rag_context
-            history_context=history_context_str,
-            cognitive_context=cognitive_context_str
+        await self.memory_service.add_chat_message(
+            user_id=user_id, role="human", content=user_message, session_id=session_id,
         )
-        messages_for_llm.append(SystemMessage(content=system_message_content))
-        logger.debug(f"System Message content generated: {system_message_content[:200]}...")
+        await self.memory_service.add_chat_message(
+            user_id=user_id, role="ai", content=display_response, session_id=session_id,
+        )
 
-
-        # Add historical messages, trimming if necessary
-        # We need to estimate token count. A rough estimate is 4 chars per token.
-        # This is a basic approach and can be refined with actual tokenizers if needed.
-        system_tokens = len(system_message_content) / 4 # Rough estimate
-        logger.debug(f"LLM Context Window: {settings.LLM_CONTEXT_WINDOW}, Threshold: {settings.LLM_TOKEN_THRESHOLD_PERCENTAGE}%")
-        logger.debug(f"System/RAG Context Tokens: {system_tokens}")
-        
-        max_history_tokens = settings.LLM_CONTEXT_WINDOW * (settings.LLM_TOKEN_THRESHOLD_PERCENTAGE / 100) - system_tokens
-        logger.debug(f"Max Tokens for History: {max_history_tokens}")
-        
-        current_history_tokens = 0
-        trimmed_history = []
-        for msg_dict in full_chat_history_from_redis:
-            msg_content = msg_dict.get("content", "")
-            msg_role = msg_dict.get("role", "")
-            
-            # Rough token count for this message
-            msg_tokens = len(msg_content) / 4
-            
-            if current_history_tokens + msg_tokens <= max_history_tokens:
-                if msg_role == "human":
-                    trimmed_history.insert(0, HumanMessage(content=msg_content))
-                elif msg_role == "ai":
-                    trimmed_history.insert(0, AIMessage(content=msg_content))
-                current_history_tokens += msg_tokens
-            else:
-                logger.warning(f"Trimming chat history to fit context window. Skipped message: {msg_content[:50]}...")
-                break # Stop adding if next message exceeds limit
-
-        logger.debug(f"trimmed history : {trimmed_history}");
-        messages_for_llm.extend(trimmed_history)
-        
-        # --- Append past AI responses to the current user message ---
-        modified_user_message_content = user_message_content
-        if past_ai_responses_for_prepend:
-            # Join all prepended responses and add a separator
-            prepended_context = "\n".join(past_ai_responses_for_prepend) + "\n\n"
-            modified_user_message_content = prepended_context + user_message_content
-            logger.debug(f"User message modified with past AI responses. New message starts with: {modified_user_message_content[:100]}...")
-        
-        # Add the current user message (potentially modified) at the end
-        messages_for_llm.append(HumanMessage(content=modified_user_message_content))
-
-        # Re-calculate total tokens for debug logging
-        final_token_count = sum(len(m.content) for m in messages_for_llm if hasattr(m, 'content')) / 4 + (len(messages_for_llm) * 4) # Add a small buffer for message objects
-        logger.debug(f"Final messages for LLM: {messages_for_llm}")
-        logger.debug(f"Final token count for LLM: {final_token_count}")
-
-        # --- Invoke LLM ---
-        try:
-            logger.info("Invoking LLM for response generation...")
-            llm_response_message = await self.llm.ainvoke(messages_for_llm)
-            ai_response_content = llm_response_message.content
-            logger.info("Gemini response generated successfully using ainvoke().")
-        except Exception as e:
-            logger.error(f"Error generating Gemini response: {e}")
-            ai_response_content = "I am sorry, but I encountered an error while processing your request."
-
-        # --- Store conversation turn in Redis ---
-        await self.context_injector_service.add_message_to_history(
+        await self.memory_service.add_memory(
             user_id=user_id,
-            role="human",
-            content=user_message_content # Store original user message in Redis
+            content=f"Q: {user_message}\nA: {display_response}",
+            memory_type="qa",
+            metadata={"message_id": message_id},
+            importance=0.3,
         )
-        await self.context_injector_service.add_message_to_history(
-            user_id=user_id,
-            role="ai",
-            content=ai_response_content
-        )
-        logger.info(f"Conversation turn stored in Redis for user '{user_id}'.")
 
-        # --- Store new Q&A in Past Questions & Answers collection ---
-        try:
-            new_qa_document = Document(
-                id=str(uuid.uuid4()),
-                content=ai_response_content,
-                metadata={"user_id": user_id, "question": user_message_content, "timestamp": datetime.now(timezone.utc).isoformat()}
-            )
-            await self.vector_store_service.add_documents(
-                user_qa_collection_name,
-                [new_qa_document]
-            )
-            logger.info(f"Stored new Q&A pair in '{user_qa_collection_name}'.")
-        except Exception as e:
-            logger.error(f"Failed to store Q&A pair in vector store: {e}")
+        human_count = len(chat_history) // 2 + 1
 
-        # --- Construct and return ChatResponse ---
-        return ChatResponse(
-            ai_response=ai_response_content,
-            # This line was corrected to extract the 'document' and then dump it.
-            source_documents=[doc_qr.document.model_dump() for doc_qr in all_source_documents_for_response if doc_qr.document],
-            message_id=message_id
-        )
+        yield _sse("done", {
+            "message_id": message_id,
+            "source_documents": [
+                {"id": m.id, "content": m.content, "metadata": m.metadata_,
+                 "type": m.memory_type, "importance": m.importance}
+                for m in combined
+            ],
+            "derivation_available": human_count >= 10,
+        })

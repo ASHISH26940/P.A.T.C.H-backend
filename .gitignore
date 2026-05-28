@@ -26,6 +26,26 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Secrets / keys
+*.pem
+*.key
+
+# Archives / tarballs
+*.tar.gz
+*.zip
+
+# Stale deployment docs
+DEPLOY_TO_RENDER.md
+RENDER_DEPLOYMENT.md
+
+# Shell test scripts (pytest replaces these)
+test_chat_endpoint.sh
+test_chat_endpoint.ps1
+test_simple.sh
+
+# Stale refactor artifacts
+Dockerfile.chromadb
+
 # Database files
 *.sqlite3
 *.db

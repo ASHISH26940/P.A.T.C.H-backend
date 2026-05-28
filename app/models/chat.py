@@ -16,8 +16,17 @@ class ChatRequest(BaseModel):
     user_message: str = Field(..., description="The current message from the user")
     collection_name: str = Field(..., description="The ChromaDB collection to query for context")
     user_id: str = Field(..., description="Unique identifier for the user/conversation session")
+    session_id: Optional[str] = Field(
+        None, description="Chat session UUID for grouping messages by conversation."
+    )
     past_messages: Optional[List[ChatMessage]] = Field(
         None, description="Recent conversation history provided by the frontend via IndexedDB."
+    )
+    persona_id: Optional[str] = Field(
+        None, description="UUID of the active persona for this chat session."
+    )
+    persona_name: Optional[str] = Field(
+        None, description="Name of the active persona for system prompt customization."
     )
 
 class ChatResponse(BaseModel):
@@ -26,5 +35,6 @@ class ChatResponse(BaseModel):
         None, description="Relevant documents retrieved from ChromaDB that informed the answer."
     )
     message_id: str = Field(..., description="Unique identifier for this AI response.")
-    # Optional: Add any debug info or flags if useful for frontend
-    # debug_info: Optional[Dict] = None
+    derivation_available: bool = Field(
+        False, description="True when enough chat history exists to derive personas."
+    )

@@ -4,7 +4,7 @@ from loguru import logger
 
 router = APIRouter()
 
-@router.get("/") # <--- CHANGE THIS LINE from "/health" to "/"
+@router.get("/")
 async def health():
     return Response("Hello world", media_type="text/plain", status_code=200)
     # Or: return PlainTextResponse("Hello world")
